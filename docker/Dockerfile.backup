@@ -1,0 +1,17 @@
+# KIRAT OS — Backup Agent with GPG Encryption
+FROM debian:bookworm-slim
+
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+        gnupg \
+        postgresql-client \
+        redis-tools \
+        curl \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Pre-create GPG homedir for backup key
+RUN mkdir -p /root/.gnupg && chmod 700 /root/.gnupg
+
+WORKDIR /backups
+CMD ["sh", "-c", "echo 'Backup agent ready. Override command in docker-compose.'"]

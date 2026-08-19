@@ -1,0 +1,25 @@
+[Unit]
+Description=KIRAT OS — Biometric AI (Behavioral User Profiling)
+After=network-online.target
+
+[Service]
+Type=simple
+User=papa-ai
+Group=ai-agents
+WorkingDirectory=/opt/kirat-os/ai-agents/papa-ai
+Environment="PYTHONPATH=/opt/kirat-os/ai-agents"
+ExecStart=/usr/bin/python3 /opt/kirat-os/ai-agents/papa-ai/main.py
+Restart=always
+RestartSec=10
+
+LimitNOFILE=65536
+MemoryMax=256M
+CPUQuota=50%
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/kirat-os /var/log
+
+[Install]
+WantedBy=multi-user.target

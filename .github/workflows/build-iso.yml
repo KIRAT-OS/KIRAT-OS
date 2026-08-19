@@ -1,0 +1,14 @@
+﻿name: Build ISO
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y debootstrap grub-pc-bin grub-efi-amd64-bin xorriso squashfs-tools
+      - run: cd installer && sudo bash build-iso.sh --output /tmp/kirat-os.iso
+      - uses: actions/upload-artifact@v4
+        with: {name: kirat-os-iso, path: /tmp/kirat-os.iso*}

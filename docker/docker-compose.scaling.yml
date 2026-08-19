@@ -1,0 +1,428 @@
+version: "3.9"
+
+###############################################################################
+# KIRAT OS — Scalable Production Stack
+# Run: docker compose -f docker-compose.scaling.yml up -d
+###############################################################################
+
+networks:
+  kirat-public:
+    driver: overlay
+    attachable: true
+  kirat-backend:
+    driver: overlay
+    internal: true
+  kirat-db:
+    driver: overlay
+    internal: true
+
+volumes:
+  traefik-certs:
+  redis-master-data:
+  redis-replica-1-data:
+  redis-replica-2-data:
+  postgres-primary-data:
+  postgres-replica-data:
+  backup-storage:
+  ollama-models:
+  prometheus-data:
+  grafana-data:
+
+secrets:
+  db_password:
+    external: true
+  redis_password:
+    external: true
+
+services:
+  # ===========================================================================
+  # LAYER 1: LOAD BALANCER (Traefik)
+  # ===========================================================================
+  traefik:
+    image: traefik:v3.0
+    command:
+      - "--api.dashboard=true"
+      - "--api.insecure=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.email=admin@kirat-os.local"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--ping=true"
+      - "--metrics.prometheus=true"
+      - "--accesslog=true"
+      - "--log.level=INFO"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"   # Traefik dashboard (bind to localhost in production)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-certs:/letsencrypt
+    networks:
+      - kirat-public
+      - kirat-backend
+    deploy:
+      replicas: 2
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.api.rule=Host(`traefik.kirat-os.local`)"
+        - "traefik.http.routers.api.service=api@internal"
+        - "traefik.http.routers.api.middlewares=auth@file"
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ===========================================================================
+  # LAYER 2: APPLICATION SERVERS (KIRAT OS Dashboard + API)
+  # ===========================================================================
+  kirat-app:
+    image: kirat-os/app:latest
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - REDIS_HOST=redis-master
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD_FILE=/run/secrets/redis_password
+      - DB_HOST=postgres-primary
+      - DB_PORT=5432
+      - DB_NAME=kirat_business
+      - DB_USER=kirat_admin
+      - DB_PASSWORD_FILE=/run/secrets/db_password
+      - KIRAT_PROFILE=high
+    secrets:
+      - db_password
+      - redis_password
+    networks:
+      - kirat-backend
+      - kirat-db
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+      rollback_config:
+        parallelism: 1
+        delay: 5s
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.kirat-app.rule=Host(`app.kirat-os.local`)"
+        - "traefik.http.routers.kirat-app.entrypoints=websecure"
+        - "traefik.http.routers.kirat-app.tls.certresolver=letsencrypt"
+        - "traefik.http.services.kirat-app.loadbalancer.server.port=8080"
+        - "traefik.http.services.kirat-app.loadbalancer.healthcheck.path=/health"
+        - "traefik.http.services.kirat-app.loadbalancer.healthcheck.interval=10s"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ===========================================================================
+  # LAYER 3: CACHE — Redis Cluster
+  # ===========================================================================
+  redis-master:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-kirat-redis-secret}
+      --appendonly yes
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --protected-mode yes
+    volumes:
+      - redis-master-data:/data
+    networks:
+      - kirat-db
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.redis == master
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  redis-replica-1:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-kirat-redis-secret}
+      --masterauth ${REDIS_PASSWORD:-kirat-redis-secret}
+      --slaveof redis-master 6379
+      --appendonly yes
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-replica-1-data:/data
+    networks:
+      - kirat-db
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.redis == replica1
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+    depends_on:
+      - redis-master
+
+  redis-replica-2:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-kirat-redis-secret}
+      --masterauth ${REDIS_PASSWORD:-kirat-redis-secret}
+      --slaveof redis-master 6379
+      --appendonly yes
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-replica-2-data:/data
+    networks:
+      - kirat-db
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.redis == replica2
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+    depends_on:
+      - redis-master
+
+  # ===========================================================================
+  # LAYER 4: DATABASE — PostgreSQL Primary + Replica
+  # ===========================================================================
+  postgres-primary:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=kirat_admin
+      - POSTGRES_PASSWORD_FILE=/run/secrets/db_password
+      - POSTGRES_DB=kirat_business
+      - PGDATA=/var/lib/postgresql/data/pgdata
+      - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256
+    secrets:
+      - db_password
+    volumes:
+      - postgres-primary-data:/var/lib/postgresql/data
+      - ./postgres-primary.conf:/etc/postgresql/postgresql.conf:ro
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    networks:
+      - kirat-db
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.postgres == primary
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kirat_admin -d kirat_business"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  postgres-replica:
+    image: postgres:16-alpine
+    environment:
+      - PGDATA=/var/lib/postgresql/data/pgdata
+      - POSTGRES_PASSWORD_FILE=/run/secrets/db_password
+      - PRIMARY_HOST=postgres-primary
+      - PRIMARY_PORT=5432
+      - REPLICATION_USER=replicator
+      - REPLICATION_PASSWORD_FILE=/run/secrets/db_password
+    secrets:
+      - db_password
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+      - ./postgres-replica.sh:/docker-entrypoint-initdb.d/01-setup-replica.sh:ro
+    networks:
+      - kirat-db
+    deploy:
+      replicas: 2
+      placement:
+        constraints:
+          - node.labels.postgres == replica
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    depends_on:
+      - postgres-primary
+
+  # ===========================================================================
+  # LAYER 5: AI / OLLAMA (Shared across app nodes)
+  # ===========================================================================
+  ollama:
+    image: ollama/ollama:latest
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_MODELS=/root/.ollama/models
+    volumes:
+      - ollama-models:/root/.ollama
+    networks:
+      - kirat-backend
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.gpu == true
+      resources:
+        limits:
+          cpus: '8.0'
+          memory: 16G
+        reservations:
+          cpus: '2.0'
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===========================================================================
+  # LAYER 6: BACKUP SERVER (Sidecar)
+  # ===========================================================================
+  backup-agent:
+    image: kirat-os/backup:latest
+    build:
+      context: ./scripts
+      dockerfile: Dockerfile.backup
+    environment:
+      - BACKUP_DIR=/backups
+      - RETENTION_DAYS=30
+      - REMOTE_TARGET=${REMOTE_TARGET:-}
+      - DB_HOST=postgres-primary
+      - REDIS_HOST=redis-master
+      - GPG_PASSPHRASE_FILE=/run/secrets/backup_passphrase
+    volumes:
+      - backup-storage:/backups
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /opt/kirat-os/security/backup-passphrase:/run/secrets/backup_passphrase:ro
+    networks:
+      - kirat-db
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.backup == true
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    command: >
+      bash -c "
+        set -euo pipefail;
+        GPG_OPTS="--batch --yes --passphrase-file /run/secrets/backup_passphrase --cipher-algo AES256 --symmetric";
+        while true; do
+          echo '[BACKUP] Running daily encrypted backup...';
+          DATE=$$(date +%Y%m%d);
+          pg_dumpall -h postgres-primary -U kirat_admin > /backups/postgres-$${DATE}.sql;
+          gpg $$GPG_OPTS -o /backups/postgres-$${DATE}.sql.gpg /backups/postgres-$${DATE}.sql;
+          rm -f /backups/postgres-$${DATE}.sql;
+          redis-cli -h redis-master SAVE;
+          cp /data/redis/dump.rdb /backups/redis-$${DATE}.rdb;
+          gpg $$GPG_OPTS -o /backups/redis-$${DATE}.rdb.gpg /backups/redis-$${DATE}.rdb;
+          rm -f /backups/redis-$${DATE}.rdb;
+          tar czf /backups/kirat-config-$${DATE}.tar.gz /opt/kirat-os /etc/nginx /etc/ssh;
+          gpg $$GPG_OPTS -o /backups/kirat-config-$${DATE}.tar.gz.gpg /backups/kirat-config-$${DATE}.tar.gz;
+          rm -f /backups/kirat-config-$${DATE}.tar.gz;
+          find /backups -mtime +30 -delete;
+          echo '[BACKUP] Encrypted backups complete. Sleeping 24h...';
+          sleep 86400;
+        done
+      "
+
+  # ===========================================================================
+  # LAYER 7: MONITORING (Prometheus + Grafana)
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - kirat-backend
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-kirat-grafana}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - kirat-public
+      - kirat-backend
+    deploy:
+      replicas: 1
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.grafana.rule=Host(`grafana.kirat-os.local`)"
+        - "traefik.http.routers.grafana.entrypoints=websecure"
+        - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
+        - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
