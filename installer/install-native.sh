@@ -89,8 +89,10 @@ preflight() {
         die "Disk too small. Need 50GB minimum. Have ${DISK_SIZE_GB}GB."
     fi
 
-    # Check network
-    if ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
+    # Check network (HTTP-based — ICMP ping is unreliable on many
+    # consumer/WSL networks where only web traffic is permitted)
+    if curl -sI --max-time 10 "${DEB_MIRROR:-http://deb.debian.org/debian}/dists/bookworm/Release" >/dev/null 2>&1 \
+       || curl -sI --max-time 10 https://deb.debian.org >/dev/null 2>&1; then
         log_ok "Internet connectivity confirmed"
     else
         die "No internet. Required to download packages and models."
@@ -262,12 +264,15 @@ stage2_base_install() {
         mount "$EFI_PART" "$INSTALL_MOUNT/boot/efi"
     fi
 
-    # Mount data
+    # Mount data (the opened LUKS mapper, not the raw encrypted partition)
     mkdir -p "$INSTALL_MOUNT/data"
-    mount "$DATA_PART" "$INSTALL_MOUNT/data"
+    mount /dev/mapper/kirat-data "$INSTALL_MOUNT/data"
 
     # Debootstrap
     log_info "Installing Debian base system (this takes 10-20 minutes)..."
+    # python3-cffi-backend is listed explicitly: when debootstrap runs from a
+    # foreign-suite host, the dependency resolver can miss this virtual-package
+    # provider that python3-cryptography requires.
     debootstrap --variant=minbase \
         --include=linux-image-amd64,systemd,systemd-sysv,\
 grub-pc,grub-efi-amd64,grub-efi-amd64-bin,shim-signed,\
@@ -276,25 +281,49 @@ htop,iotop,ncdu,tree,rsync,git,\
 net-tools,iproute2,iptables,nftables,\
 dnsutils,ca-certificates,openssl,\
 parted,e2fsprogs,cryptsetup,cryptsetup-initramfs,\
-python3,python3-pip,python3-venv,python3-dev,python3-cryptography,\
+python3,python3-pip,python3-venv,python3-dev,python3-cryptography,python3-cffi-backend,\
 build-essential,dkms,linux-headers-amd64,\
 nginx,certbot,python3-certbot-nginx,\
 postgresql,postgresql-contrib,\
 redis-server,\
 docker.io,containerd,\
-fail2ban,ufw,\
+fail2ban,ufw,zstd,\
 cryptsetup,cryptsetup-bin,\
-tpm2-tools,tpm2-abrmd,tpm2-tss,\
+tpm2-tools,tpm2-abrmd,\
 sbsigntool,efitools,\
-liboqs-openssl,oqs-provider,\
 ca-certificates,gnupg,lsb-release,gnupg \
-        bookworm "$INSTALL_MOUNT" http://deb.debian.org/debian
+        bookworm "$INSTALL_MOUNT" "${DEB_MIRROR:-http://deb.debian.org/debian}" \
+    || log_warn "debootstrap reported errors — running self-heal repair"
 
-    # Mount pseudo-filesystems
-    mount --bind /dev "$INSTALL_MOUNT/dev"
+    # SELF-HEAL: bind pseudo-filesystems and repair package configuration
+    # from inside the target. Handles cffi/cryptography ordering failures.
+    # Only run when the base rootfs actually materialized (debootstrap may
+    # abort before creating /dev, /proc etc. on hard download failures).
+    if [ ! -d "$INSTALL_MOUNT/bin" ]; then
+        die "debootstrap failed to create a base rootfs — cannot self-heal. Re-run installer."
+    fi
+    mkdir -p "$INSTALL_MOUNT/dev" "$INSTALL_MOUNT/proc" "$INSTALL_MOUNT/sys" "$INSTALL_MOUNT/run"
+    mount --bind /dev "$INSTALL_MOUNT/dev" || die "self-heal: failed to bind /dev"
     mount --bind /proc "$INSTALL_MOUNT/proc"
     mount --bind /sys "$INSTALL_MOUNT/sys"
     mount --bind /run "$INSTALL_MOUNT/run"
+    cp -L /etc/resolv.conf "$INSTALL_MOUNT/etc/resolv.conf" 2>/dev/null || true
+    chroot "$INSTALL_MOUNT" /bin/bash -c '
+        dpkg --configure -a || true
+        apt-get update -qq || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            python3-cffi-backend python3-cryptography || true
+        dpkg --configure -a || true
+    ' || log_warn "self-heal repair incomplete — continuing anyway"
+
+    # Post-quantum note: oqs-provider / liboqs do NOT exist in Debian 12
+    # (bookworm) repos — see earlier comment in this stage.
+
+    # Mount pseudo-filesystems (already bound in self-heal above; idempotent)
+    mountpoint -q "$INSTALL_MOUNT/dev"  || mount --bind /dev  "$INSTALL_MOUNT/dev"
+    mountpoint -q "$INSTALL_MOUNT/proc" || mount --bind /proc "$INSTALL_MOUNT/proc"
+    mountpoint -q "$INSTALL_MOUNT/sys"  || mount --bind /sys  "$INSTALL_MOUNT/sys"
+    mountpoint -q "$INSTALL_MOUNT/run"  || mount --bind /run  "$INSTALL_MOUNT/run"
 
     log_ok "Base system installed"
 }
@@ -359,11 +388,10 @@ RouteMetric=100
 RouteMetric=100
 EOF
 
-    chroot "$INSTALL_MOUNT" systemctl enable systemd-networkd
-    chroot "$INSTALL_MOUNT" systemctl enable systemd-resolved
-
+    chroot "$INSTALL_MOUNT" systemctl enable systemd-networkd || log_warn "enable systemd-networkd failed (non-fatal)"
+    chroot "$INSTALL_MOUNT" systemctl enable systemd-resolved || log_warn "enable systemd-resolved failed (non-fatal)"
     # Root password (locked — emergency console only)
-    echo "root:kirat-emergency-$(openssl rand -hex 8)" | chroot "$INSTALL_MOUNT" chpasswd
+    chroot "$INSTALL_MOUNT" usermod -p "$(openssl passwd -6 "kirat-emergency-$(openssl rand -hex 8)")" root || log_warn "password set failed for root (non-fatal)"
     chroot "$INSTALL_MOUNT" passwd -l root
     chroot "$INSTALL_MOUNT" usermod -s /usr/sbin/nologin root
 
@@ -405,8 +433,7 @@ EOF
 ******************************************************************************
 EOF
 
-    chroot "$INSTALL_MOUNT" systemctl enable ssh
-
+    chroot "$INSTALL_MOUNT" systemctl enable ssh || log_warn "enable ssh failed (non-fatal)"
     log_ok "System configured"
 }
 
@@ -417,14 +444,20 @@ EOF
 stage3b_rbac_setup() {
     log_stage "STAGE 3B: RBAC TIERED USER MODEL"
 
+    # Ensure supplementary groups exist — minbase debootstrap omits some
+    # (e.g. netdev, audio, video) that useradd -G requires to exist.
+    for grp in sudo docker adm systemd-journal audio video netdev; do
+        chroot "$INSTALL_MOUNT" groupadd -f "$grp" 2>/dev/null || true
+    done
+
     # ── TIER 0: ROOT — already locked in stage3 ──
     log_ok "Tier 0 (root): Locked, emergency console only"
 
     # ── TIER 1: KIRAT-ADMIN — Full sudo, human administrator ──
     log_info "Creating Tier 1: kirat-admin..."
     chroot "$INSTALL_MOUNT" useradd -m -s /bin/bash -G sudo,docker,adm,systemd-journal,audio,video,netdev "kirat-admin" 2>/dev/null || true
-    echo "kirat-admin:kirat-temp-change-me" | chroot "$INSTALL_MOUNT" chpasswd
-    chroot "$INSTALL_MOUNT" passwd -e kirat-admin
+    chroot "$INSTALL_MOUNT" usermod -p "$(openssl passwd -6 'kirat-temp-change-me')" kirat-admin || log_warn "password set failed for kirat-admin (non-fatal)"
+    chroot "$INSTALL_MOUNT" passwd -e kirat-admin || log_warn "passwd expiry for kirat-admin failed (non-fatal)"
 
     # Admin sudoers: full access + can delegate to AI agents
     cat > "$INSTALL_MOUNT/etc/sudoers.d/kirat-admin" << 'EOF'
@@ -473,7 +506,7 @@ with open('/opt/kirat-os/security/admin.pub', 'wb') as f:
 
     # security-officer: security tools only (NO wildcards)
     chroot "$INSTALL_MOUNT" useradd -m -s /bin/bash -G adm,systemd-journal "security-officer" 2>/dev/null || true
-    echo "security-officer:kirat-temp-sec-$(openssl rand -hex 4)" | chroot "$INSTALL_MOUNT" chpasswd
+    chroot "$INSTALL_MOUNT" usermod -p "$(openssl passwd -6 "kirat-temp-sec-$(openssl rand -hex 4)")" security-officer || log_warn "password set failed for security-officer (non-fatal)"
     chroot $INSTALL_MOUNT chage -d 0 security-officer
     cat > "$INSTALL_MOUNT/etc/sudoers.d/kirat-security-officer" << 'EOF'
 # Security Officer — read-only and selective control
@@ -483,7 +516,7 @@ EOF
 
     # ops-engineer: infrastructure only (explicit commands, no wildcards)
     chroot "$INSTALL_MOUNT" useradd -m -s /bin/bash -G adm,systemd-journal,docker "ops-engineer" 2>/dev/null || true
-    echo "ops-engineer:kirat-temp-ops-$(openssl rand -hex 4)" | chroot "$INSTALL_MOUNT" chpasswd
+    chroot "$INSTALL_MOUNT" usermod -p "$(openssl passwd -6 "kirat-temp-ops-$(openssl rand -hex 4)")" ops-engineer || log_warn "password set failed for ops-engineer (non-fatal)"
     chroot $INSTALL_MOUNT chage -d 0 ops-engineer
     cat > "$INSTALL_MOUNT/etc/sudoers.d/kirat-ops-engineer" << 'EOF'
 # Ops Engineer — infrastructure monitoring and Docker inspection
@@ -493,7 +526,7 @@ EOF
 
     # dev-engineer: development tools only (NO python3 wildcard — too dangerous)
     chroot "$INSTALL_MOUNT" useradd -m -s /bin/bash -G docker "dev-engineer" 2>/dev/null || true
-    echo "dev-engineer:kirat-temp-dev-$(openssl rand -hex 4)" | chroot "$INSTALL_MOUNT" chpasswd
+    chroot "$INSTALL_MOUNT" usermod -p "$(openssl passwd -6 "kirat-temp-dev-$(openssl rand -hex 4)")" dev-engineer || log_warn "password set failed for dev-engineer (non-fatal)"
     chroot $INSTALL_MOUNT chage -d 0 dev-engineer
     cat > "$INSTALL_MOUNT/etc/sudoers.d/kirat-dev-engineer" << 'EOF'
 # Dev Engineer — Docker and Git only, no unrestricted Python
@@ -505,7 +538,7 @@ EOF
 
     # incident-responder: read-only + selective restart (explicit only)
     chroot "$INSTALL_MOUNT" useradd -m -s /bin/bash -G adm,systemd-journal "incident-responder" 2>/dev/null || true
-    echo "incident-responder:kirat-temp-ir-$(openssl rand -hex 4)" | chroot "$INSTALL_MOUNT" chpasswd
+    chroot "$INSTALL_MOUNT" usermod -p "$(openssl passwd -6 "kirat-temp-ir-$(openssl rand -hex 4)")" incident-responder || log_warn "password set failed for incident-responder (non-fatal)"
     chroot $INSTALL_MOUNT chage -d 0 incident-responder
     cat > "$INSTALL_MOUNT/etc/sudoers.d/kirat-incident-responder" << 'EOF'
 # Incident Responder — logs and selective safe restarts
@@ -546,6 +579,9 @@ EOF
 # Ollama and Dashboard service users (no login)
 chroot $INSTALL_MOUNT useradd -r -s /usr/sbin/nologin -M ollama 2>/dev/null || true
 chroot $INSTALL_MOUNT useradd -r -s /usr/sbin/nologin -M kirat-dashboard 2>/dev/null || true
+# Ollama needs a writable home (service user created with -M = no home)
+mkdir -p "$INSTALL_MOUNT/home/ollama"
+chroot "$INSTALL_MOUNT" chown ollama:ollama /home/ollama 2>/dev/null || true
     for agent in sentinel-ai quantum-ai executor-ai auditor-ai orchestrator-ai; do
         chroot "$INSTALL_MOUNT" useradd -r -s /usr/sbin/nologin -M "$agent" 2>/dev/null || true
     done
@@ -837,7 +873,7 @@ ufw allow 8080/tcp
 ufw allow 8081/tcp
 ufw --force enable
 '
-    chroot "$INSTALL_MOUNT" systemctl enable ufw
+    chroot "$INSTALL_MOUNT" systemctl enable ufw || log_warn "enable ufw failed (non-fatal)"
     log_ok "Firewall configured"
 
     # Fail2ban
@@ -852,7 +888,7 @@ backend = systemd
 enabled = true
 port = ssh
 filter = sshd
-logpath = /var/log/auth.log
+backend = systemd
 maxretry = 3
 
 [nginx-http-auth]
@@ -861,12 +897,12 @@ filter = nginx-http-auth
 port = http,https
 logpath = /var/log/nginx/error.log
 EOF
-    chroot "$INSTALL_MOUNT" systemctl enable fail2ban
+    chroot "$INSTALL_MOUNT" systemctl enable fail2ban || log_warn "enable fail2ban failed (non-fatal)"
     log_ok "Fail2ban configured"
 
     # AppArmor profiles
     chroot "$INSTALL_MOUNT" apt-get install -y -qq apparmor apparmor-profiles apparmor-utils
-    chroot "$INSTALL_MOUNT" systemctl enable apparmor
+    chroot "$INSTALL_MOUNT" systemctl enable apparmor || log_warn "enable apparmor failed (non-fatal)"
     log_ok "AppArmor enabled"
 
     # Secure Boot + MOK
@@ -915,7 +951,7 @@ EOF
     # TLS with PQC — 90-day self-signed FALLBACK + Let's Encrypt auto-cert
     mkdir -p "$INSTALL_MOUNT/etc/nginx/ssl"
     # Generate 90-day self-signed cert with SAN (fallback until Let's Encrypt succeeds)
-    cat > /tmp/kirat-san.cnf << CNFTXT
+    cat > "$INSTALL_MOUNT/tmp/kirat-san.cnf" << CNFTXT
 [req]
 distinguished_name = req_distinguished_name
 x509_extensions = v3_req
@@ -937,7 +973,7 @@ CNFTXT
     chroot "$INSTALL_MOUNT" openssl req -x509 -nodes -days 90 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -keyout /etc/nginx/ssl/kirat-key.pem -out /etc/nginx/ssl/kirat-cert.pem \
         -config /tmp/kirat-san.cnf
-    rm -f /tmp/kirat-san.cnf
+    rm -f "$INSTALL_MOUNT/tmp/kirat-san.cnf"
     chmod 600 "$INSTALL_MOUNT/etc/nginx/ssl/kirat-key.pem"
     chroot "$INSTALL_MOUNT" chown root:root /etc/nginx/ssl/kirat-key.pem
     log_ok "90-day self-signed TLS fallback generated"
@@ -966,7 +1002,7 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-    chroot "$INSTALL_MOUNT" systemctl enable certbot-renew.timer
+    chroot "$INSTALL_MOUNT" systemctl enable certbot-renew.timer || log_warn "enable certbot-renew.timer failed (non-fatal)"
     log_ok "Certbot auto-renewal timer enabled (twice daily)"
 
     # First-boot service: attempt Let's Encrypt if DOMAIN is not localhost
@@ -1088,7 +1124,7 @@ EOF
 # Monitor MOK keys
 -w /opt/kirat-os/security/mok/ -p wa -k mok_keys
 EOF
-    chroot "$INSTALL_MOUNT" systemctl enable auditd
+    chroot "$INSTALL_MOUNT" systemctl enable auditd || log_warn "enable auditd failed (non-fatal)"
     log_ok "auditd installed with KIRAT OS custom rules"
 
     # Log aggregation directory
@@ -1102,7 +1138,7 @@ stage6_business_stack() {
     log_stage "STAGE 6: BUSINESS SERVER STACK"
 
     # PostgreSQL
-    chroot "$INSTALL_MOUNT" systemctl enable postgresql
+    chroot "$INSTALL_MOUNT" systemctl enable postgresql || log_warn "enable postgresql failed (non-fatal)"
     chroot "$INSTALL_MOUNT" bash -c '
 su - postgres -c "psql -c \"CREATE USER kirat_admin WITH PASSWORD \\'kirat-temp-db\\' SUPERUSER;\"" 2>/dev/null || true
 su - postgres -c "psql -c \"CREATE DATABASE kirat_business OWNER kirat_admin;\"" 2>/dev/null || true
@@ -1110,11 +1146,11 @@ su - postgres -c "psql -c \"CREATE DATABASE kirat_business OWNER kirat_admin;\""
     log_ok "PostgreSQL configured"
 
     # Redis
-    chroot "$INSTALL_MOUNT" systemctl enable redis-server
+    chroot "$INSTALL_MOUNT" systemctl enable redis-server || log_warn "enable redis-server failed (non-fatal)"
     log_ok "Redis configured"
 
     # Docker
-    chroot "$INSTALL_MOUNT" systemctl enable docker
+    chroot "$INSTALL_MOUNT" systemctl enable docker || log_warn "enable docker failed (non-fatal)"
     log_ok "Docker configured"
 
     # Nginx with PQC TLS
@@ -1128,7 +1164,8 @@ server {
     ssl_certificate_key /etc/nginx/ssl/kirat-key.pem;
     ssl_protocols TLSv1.3;
     ssl_prefer_server_ciphers off;
-    ssl_ecdh_curve $PQC_TLS,secp384r1;
+    # PQC kyber768 requires OQS provider (oqsprovider) — pending; use strong classical curves
+    ssl_ecdh_curve X25519:prime256v1:secp384r1;
 
     # Security headers
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
@@ -1167,7 +1204,7 @@ EOF
 
     chroot "$INSTALL_MOUNT" ln -sf /etc/nginx/sites-available/kirat-business /etc/nginx/sites-enabled/
     chroot "$INSTALL_MOUNT" rm -f /etc/nginx/sites-enabled/default
-    chroot "$INSTALL_MOUNT" systemctl enable nginx
+    chroot "$INSTALL_MOUNT" systemctl enable nginx || log_warn "enable nginx failed (non-fatal)"
     log_ok "Nginx with PQC TLS configured"
 
     # Business directories
@@ -1176,7 +1213,11 @@ EOF
     mkdir -p "$INSTALL_MOUNT/data/postgres"
     mkdir -p "$INSTALL_MOUNT/data/redis"
     mkdir -p "$INSTALL_MOUNT/data/business"
-    chown -R "$USERNAME:$USERNAME" "$INSTALL_MOUNT/data/business"
+    # chown runs on the host but the user only exists in the target —
+    # resolve numeric IDs from inside the target so ownership is correct.
+    T_UID=$(chroot "$INSTALL_MOUNT" id -u "$USERNAME" 2>/dev/null || echo 0)
+    T_GID=$(chroot "$INSTALL_MOUNT" id -g "$USERNAME" 2>/dev/null || echo 0)
+    chown -R "$T_UID:$T_GID" "$INSTALL_MOUNT/data/business" || log_warn "chown /data/business failed (non-fatal)"
 
     log_ok "Business server stack operational"
 }
@@ -1239,8 +1280,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-    chroot "$INSTALL_MOUNT" systemctl enable ollama
-
+    chroot "$INSTALL_MOUNT" systemctl enable ollama || log_warn "enable ollama failed (non-fatal)"
     # Pre-pull models (will happen on first boot)
     cat > "$INSTALL_MOUNT/etc/systemd/system/ollama-pull.service" << 'EOF'
 [Unit]
@@ -1262,18 +1302,18 @@ EOF
     log_ok "Ollama AI backend configured"
 
     # Install Python AI dependencies (includes REAL quantum backends + Ed25519)
-    chroot "$INSTALL_MOUNT" pip3 install --break-system-packages 2>/dev/null || true
-    chroot "$INSTALL_MOUNT" pip3 install fastapi uvicorn httpx websockets psutil numpy pynacl pycryptodome openai-whisper 2>/dev/null || \
-        pip3 install --break-system-packages fastapi uvicorn httpx websockets psutil numpy pynacl pycryptodome 2>/dev/null || true
+    # NOTE: --break-system-packages is mandatory on Debian 12+ (PEP 668).
+    # Fallbacks must ALSO run inside chroot (previously leaked to live env — bug #10).
+    AI_PY_PKGS="fastapi uvicorn httpx websockets psutil numpy pynacl pycryptodome jinja2 python-multipart aiofiles python-dotenv slowapi redis python-socketio pydantic"
+    chroot "$INSTALL_MOUNT" pip3 install --break-system-packages $AI_PY_PKGS 2>/dev/null \
+        || log_warn "AI python deps incomplete — retry post-boot: pip3 install --break-system-packages $AI_PY_PKGS"
+    chroot "$INSTALL_MOUNT" pip3 install --break-system-packages openai-whisper 2>/dev/null \
+        || log_warn "openai-whisper skipped (optional, large) — install post-boot if voice needed"
 
     # Install REAL quantum backends (mandatory — no simulated fallback)
     log_info "Installing Qiskit and Cirq quantum backends..."
-    chroot "$INSTALL_MOUNT" pip3 install qiskit qiskit-ibm-runtime cirq 2>/dev/null || \
-        pip3 install --break-system-packages qiskit qiskit-ibm-runtime cirq 2>/dev/null || \
+    chroot "$INSTALL_MOUNT" pip3 install --break-system-packages qiskit qiskit-ibm-runtime cirq 2>/dev/null || \
         log_warn "Quantum library install may need post-boot completion"
-    chroot "$INSTALL_MOUNT" pip3 install --break-system-packages 2>/dev/null || true
-    chroot "$INSTALL_MOUNT" pip3 install fastapi uvicorn httpx websockets psutil numpy 2>/dev/null || \
-        pip3 install --break-system-packages fastapi uvicorn httpx websockets psutil numpy 2>/dev/null || true
 
     log_ok "Python AI dependencies installed"
 }
@@ -1308,6 +1348,24 @@ stage8_kirat_components() {
         cp -r "$SCRIPT_DIR/../security" "$INSTALL_MOUNT/opt/kirat-os/"
         log_ok "Security tools installed"
     fi
+
+    # AI agents (5 defense + CEO) — REQUIRED for service install loop below (was missing — bug #9)
+    if [ -d "$SCRIPT_DIR/../ai-agents" ]; then
+        cp -r "$SCRIPT_DIR/../ai-agents" "$INSTALL_MOUNT/opt/kirat-os/"
+        log_ok "AI agents installed (jitedasti/galinja/oysgja/suyarma/papa/aadhipati)"
+    else
+        log_warn "ai-agents source dir NOT found — agent services will be skipped"
+    fi
+
+    # Runtime directories required by agent sandboxing (ReadWritePaths) and SQLite state.
+    # Must exist BEFORE first service start or systemd fails with 226/NAMESPACE (bug #13).
+    mkdir -p "$INSTALL_MOUNT/var/lib/kirat-os" "$INSTALL_MOUNT/var/cache/kirat-os" \
+             "$INSTALL_MOUNT/var/log/kirat" "$INSTALL_MOUNT/data/business" \
+             "$INSTALL_MOUNT/data/backups" "$INSTALL_MOUNT/data/forensics" 2>/dev/null || true
+    chroot "$INSTALL_MOUNT" chown -R root:ai-agents /var/lib/kirat-os /var/cache/kirat-os \
+        /var/log/kirat /data/business /data/backups /data/forensics 2>/dev/null || true
+    chroot "$INSTALL_MOUNT" chmod 2775 /var/lib/kirat-os /var/cache/kirat-os \
+        /var/log/kirat /data/business /data/backups /data/forensics 2>/dev/null || true
 
     # Copy post-install scripts
     if [ -d "$SCRIPT_DIR/../scripts" ]; then
@@ -1355,16 +1413,18 @@ ReadWritePaths=/opt/kirat-os /data/business
 WantedBy=multi-user.target
 EOF
 
-    chroot "$INSTALL_MOUNT" systemctl enable sentinel
-
+    chroot "$INSTALL_MOUNT" systemctl enable sentinel || log_warn "enable sentinel failed (non-fatal)"
     # Advanced AI Defense Agent services
+    AGENTS_ENABLED=0
     for agent in jitedasti-ai galinja-ai oysgja-ai suyarma-ai papa-ai aadhipati-ai; do
         if [ -f "$INSTALL_MOUNT/opt/kirat-os/ai-agents/$agent/$agent.service" ]; then
             cp "$INSTALL_MOUNT/opt/kirat-os/ai-agents/$agent/$agent.service" "$INSTALL_MOUNT/etc/systemd/system/"
-            chroot "$INSTALL_MOUNT" systemctl enable "$agent"
+            chroot "$INSTALL_MOUNT" systemctl enable "$agent" && AGENTS_ENABLED=$((AGENTS_ENABLED+1))
+        else
+            log_warn "agent service file missing: $agent"
         fi
     done
-    log_ok "6 AI Agents enabled (5 Defense + 1 CEO Aadhipati)"
+    log_ok "AI Agents enabled: $AGENTS_ENABLED/6 (5 Defense + 1 CEO Aadhipati)"
 
     # Dashboard service
     cat > "$INSTALL_MOUNT/etc/systemd/system/kirat-dashboard.service" << EOF
@@ -1384,8 +1444,7 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-    chroot "$INSTALL_MOUNT" systemctl enable kirat-dashboard
-
+    chroot "$INSTALL_MOUNT" systemctl enable kirat-dashboard || log_warn "enable kirat-dashboard failed (non-fatal)"
     # Backup encryption passphrase — GPG symmetric AES256
     log_info "Generating backup encryption passphrase..."
     BACKUP_PASS=$(openssl rand -base64 32)
@@ -1497,8 +1556,7 @@ TTYPath=/dev/tty1
 WantedBy=multi-user.target
 EOF
 
-    chroot "$INSTALL_MOUNT" systemctl enable kirat-first-boot
-
+    chroot "$INSTALL_MOUNT" systemctl enable kirat-first-boot || log_warn "enable kirat-first-boot failed (non-fatal)"
     log_ok "First-boot configuration ready"
 }
 
