@@ -539,11 +539,12 @@ EMBEDEOF
         mcopy -i "$efi_img" "$grub" ::/EFI/BOOT/BOOTX64.EFI
     fi
     [[ -n "$mmx" ]] && mcopy -i "$efi_img" "$mmx" ::/EFI/BOOT/mmx64.efi
-    if [[ -f /usr/lib/shim/fbx64.efi.signed ]]; then
-        mcopy -i "$efi_img" /usr/lib/shim/fbx64.efi.signed ::/EFI/BOOT/fbx64.efi
-        [[ -f /usr/lib/shim/BOOTX64.CSV ]] && \
-            mcopy -i "$efi_img" /usr/lib/shim/BOOTX64.CSV ::/EFI/BOOT/BOOTX64.CSV
-    fi
+    # NOTE: do NOT add fbx64.efi / BOOTX64.CSV to the ESP. When shim is
+    # booted from the removable-media path and finds fbx64+CSV, it runs the
+    # fallback loader which writes a NVRAM entry and RESETS the machine —
+    # under OVMF (and many laptops booting USB/CD) this loops forever.
+    # Verified by boot test on 2026-10-13 (minimal ISO + fbx = reset loop;
+    # identical ISO without fbx boots to menu).
 
     # Trampoline grub.cfg: signed GRUB reads this from the ESP, then hops to
     # the real menu on the ISO9660 filesystem.
@@ -565,11 +566,7 @@ ESPEOF
         cp "$grub" "$WORK_DIR/EFI/BOOT/BOOTX64.EFI"
     fi
     [[ -n "$mmx" ]] && cp "$mmx" "$WORK_DIR/EFI/BOOT/mmx64.efi"
-    if [[ -f /usr/lib/shim/fbx64.efi.signed ]]; then
-        cp /usr/lib/shim/fbx64.efi.signed "$WORK_DIR/EFI/BOOT/fbx64.efi"
-        [[ -f /usr/lib/shim/BOOTX64.CSV ]] && \
-            cp /usr/lib/shim/BOOTX64.CSV "$WORK_DIR/EFI/BOOT/BOOTX64.CSV"
-    fi
+    # No fbx64.efi / BOOTX64.CSV here either (see ESP note above).
     cp "$WORK_DIR/efi/grub.cfg.esp" "$WORK_DIR/EFI/BOOT/grub.cfg"
 
     # x86_64-efi modules on the ISO so grub.cfg's insmods (gfxterm/png/...)
