@@ -491,6 +491,7 @@ EMBEDEOF
     grub-mkimage -O i386-pc -d "$grub_i386" \
         -o "$WORK_DIR/efi/core.img" \
         -c "$WORK_DIR/efi/embed.cfg" \
+        -p /boot/grub \
         biosdisk iso9660 || { err "grub-mkimage (BIOS) failed"; exit 1; }
     cat "$grub_i386/cdboot.img" "$WORK_DIR/efi/core.img" \
         > "$WORK_DIR/boot/grub/i386-pc/eltorito.img" || { err "eltorito.img build failed"; exit 1; }
@@ -551,28 +552,48 @@ ESPEOF
     # Mirror the EFI binaries onto the ISO9660 tree (some firmwares and
     # manual copies look there; also matches previous KIRAT ISO layout).
     mkdir -p "$WORK_DIR/EFI/BOOT"
-    mcopy -i "$efi_img" -s ::/EFI/BOOT "$WORK_DIR/EFI/BOOT-tmp" 2>/dev/null || true
-    if [[ -d "$WORK_DIR/EFI/BOOT-tmp" ]]; then
-        cp "$WORK_DIR/EFI/BOOT-tmp"/* "$WORK_DIR/EFI/BOOT/" 2>/dev/null || true
-        rm -rf "$WORK_DIR/EFI/BOOT-tmp"
+    if [[ "$secure_boot" == true ]]; then
+        cp "$shim" "$WORK_DIR/EFI/BOOT/BOOTX64.EFI"
+        cp "$grub" "$WORK_DIR/EFI/BOOT/grubx64.efi"
+    else
+        cp "$grub" "$WORK_DIR/EFI/BOOT/BOOTX64.EFI"
+    fi
+    [[ -n "$mmx" ]] && cp "$mmx" "$WORK_DIR/EFI/BOOT/mmx64.efi"
+    if [[ -f /usr/lib/shim/fbx64.efi.signed ]]; then
+        cp /usr/lib/shim/fbx64.efi.signed "$WORK_DIR/EFI/BOOT/fbx64.efi"
+        [[ -f /usr/lib/shim/BOOTX64.CSV ]] && \
+            cp /usr/lib/shim/BOOTX64.CSV "$WORK_DIR/EFI/BOOT/BOOTX64.CSV"
+    fi
+    cp "$WORK_DIR/efi/grub.cfg.esp" "$WORK_DIR/EFI/BOOT/grub.cfg"
+
+    # x86_64-efi modules on the ISO so grub.cfg's insmods (gfxterm/png/...)
+    # succeed when Secure Boot is off. Under SB the signed monolithic GRUB
+    # has these embedded; on-disk insmod fails harmlessly (text-mode menu).
+    if [[ -d /usr/lib/grub/x86_64-efi ]]; then
+        mkdir -p "$WORK_DIR/boot/grub/x86_64-efi"
+        cp /usr/lib/grub/x86_64-efi/*.mod /usr/lib/grub/x86_64-efi/*.lst 2>/dev/null \
+            "$WORK_DIR/boot/grub/x86_64-efi/" || true
     fi
 
     # ── 3. Assemble hybrid ISO (BIOS + UEFI + USB) with xorriso ─────────────
+    # Flag set mirrors the proven grub-mkrescue invocation that produced the
+    # verified-bootable v2.0.0 ISO on this build host.
     xorriso -as mkisofs \
         -iso-level 3 \
         -full-iso9660-filenames \
         -volid "KIRAT-OS-${KIRAT_VERSION}" \
         --grub2-mbr "$grub_i386/boot_hybrid.img" \
-        -partition_offset 16 \
-        --mbr-force-bootable \
-        -eltorito-catalog boot/grub/boot.cat \
-        -eltorito-boot boot/grub/i386-pc/eltorito.img \
+        --protective-msdos-label \
+        -partition_cyl_align off \
+        -partition_offset 0 \
+        -c boot/grub/boot.cat \
+        -b boot/grub/i386-pc/eltorito.img \
         -no-emul-boot \
         -boot-load-size 4 \
         -boot-info-table \
         --grub2-boot-info \
         -eltorito-alt-boot \
-        --efi-boot efi/efiboot.img \
+        -e efi/efiboot.img \
         -efi-boot-part --efi-boot-image \
         -no-emul-boot \
         -isohybrid-gpt-basdat \
