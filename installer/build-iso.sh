@@ -488,11 +488,16 @@ set prefix=($root)/boot/grub
 configfile /boot/grub/grub.cfg
 EMBEDEOF
 
+    # Modules must include everything embed.cfg uses (search, configfile)
+    # plus normal (menu) and linux/linux16 (boot entries) — grub-mkimage
+    # does NOT auto-resolve command->module deps; missing modules produce
+    # "Unknown command" at boot (verified 2026-10-13 BIOS boot test).
     grub-mkimage -O i386-pc -d "$grub_i386" \
         -o "$WORK_DIR/efi/core.img" \
         -c "$WORK_DIR/efi/embed.cfg" \
         -p /boot/grub \
-        biosdisk iso9660 || { err "grub-mkimage (BIOS) failed"; exit 1; }
+        biosdisk iso9660 search configfile normal linux linux16 \
+        || { err "grub-mkimage (BIOS) failed"; exit 1; }
     cat "$grub_i386/cdboot.img" "$WORK_DIR/efi/core.img" \
         > "$WORK_DIR/boot/grub/i386-pc/eltorito.img" || { err "eltorito.img build failed"; exit 1; }
     ok "BIOS El Torito image created"
