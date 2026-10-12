@@ -90,7 +90,7 @@ check_root() {
 
 # ── Dependency Check ────────────────────────────────────────────────────────
 check_deps() {
-    local deps=("debootstrap" "grub-mkrescue" "xorriso" "mksquashfs" "curl")
+    local deps=("debootstrap" "grub-mkrescue" "xorriso" "mksquashfs" "curl" "mkfs.vfat" "mcopy")
     local missing=()
 
     for dep in "${deps[@]}"; do
@@ -119,6 +119,10 @@ setup_workdir() {
 cleanup() {
     if [[ "$CLEANUP" == true ]] && [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then
         info "Cleaning up working directory..."
+        # Unmount any lingering bind mounts first (busy mounts make rm fail)
+        for mp in run sys proc dev/pts dev; do
+            umount -l "$WORK_DIR/live/rootfs/$mp" 2>/dev/null || true
+        done
         rm -rf "$WORK_DIR"
     fi
 }
@@ -129,13 +133,40 @@ stage_build_rootfs() {
     local rootfs="$WORK_DIR/live/rootfs"
     mkdir -p "$rootfs"
 
-    # Debootstrap minimal base
-    debootstrap --arch="$ARCH" --variant=minbase \
-        --include="linux-image-amd64,live-boot,cryptsetup,lvm2,systemd,systemd-sysv,openssh-server,nginx,python3,python3-pip,nodejs,npm,postgresql,postgresql-contrib,ufw,fail2ban,auditd,apparmor,sysstat,htop,curl,wget,vim,nano,sudo,dbus,polkitd,ca-certificates,openssl,gnupg,apt-transport-https,net-tools,iputils-ping,dnsutils,iptables,ipset,wireguard-tools,qrencode,openvpn,easy-rsa,strongswan,strongswan-pki,libstrongswan-extra-plugins,libcharon-extra-plugins,acl,attr,quota,quotatool,nfs-common,samba,rsync,git,unzip,tar,gzip,bzip2,xz-utils,zstd,lz4,lzo,p7zip-full,lm-sensors,smartmontools,ethtool,pciutils,usbutils,cpufrequtils,thermald,dpkg-dev,build-essential,dkms,linux-headers-amd64,bc,bison,flex,libssl-dev,libelf-dev,debhelper,quilt,lintian,fakeroot,devscripts,debootstrap,squashfs-tools,xorriso,grub-pc-bin,grub-efi-amd64-bin,efibootmgr,shim-signed,shim-helpers-amd64-signed,mokutil,sbsigntool,systemd-boot,systemd-boot-efi,tpm2-tools,tpm2-abrmd,libtss2-esys-3.0.2-0,libtss2-rc0,libtss2-mu0,libtss2-tcti-device0,libtss2-tcti-mssim0,p11-kit,opensc,libpam-pkcs11,libpam-u2f,fido2-tools,libfido2-1,softhsm2,libengine-pkcs11-openssl,gnutls-bin,libgnutls30,libnss3-tools,ca-certificates-java,java-common,default-jre-headless,containerd.io,docker-ce,docker-ce-cli,docker-compose-plugin,kubectl,kubeadm,kubelet,helm,minikube,cri-o-runc,cri-tools,buildah,podman,skopeo,slirp4netns,fuse-overlayfs,uidmap,slirp4netns,qemu-system-x86,qemu-utils,libvirt-daemon-system,libvirt-clients,virt-manager,ovmf,ovmf-ia32, seabios,ipxe-qemu" \
+    # Two-stage debootstrap: unpack first, then configure inside a properly
+    # bind-mounted chroot. postinst scripts (polkitd, dbus, golang-*) need
+    # /proc /sys /dev /run present — plain debootstrap chroot lacks them (WSL2).
+    # Debian-bookworm-native packages only (docker-ce/kubectl/helm live in
+    # third-party repos — debootstrap would fail; docker.io covers containers)
+    local PKGS="linux-image-amd64,live-boot,live-config,cryptsetup,lvm2,systemd,systemd-sysv,libpam-systemd,openssh-server,nginx,python3,python3-pip,postgresql,postgresql-contrib,ufw,fail2ban,auditd,apparmor,sysstat,htop,curl,wget,vim,nano,sudo,dbus,polkitd,ca-certificates,openssl,gnupg,apt-transport-https,net-tools,iputils-ping,dnsutils,iptables,ipset,wireguard-tools,qrencode,acl,attr,quota,quotatool,rsync,git,unzip,tar,gzip,bzip2,xz-utils,zstd,lz4,lzop,p7zip-full,lm-sensors,smartmontools,ethtool,pciutils,usbutils,cpufrequtils,thermald,dpkg-dev,build-essential,dkms,linux-headers-amd64,bc,bison,flex,libssl-dev,libelf-dev,fakeroot,debootstrap,squashfs-tools,xorriso,grub-pc-bin,grub-efi-amd64-bin,efibootmgr,mokutil,sbsigntool,tpm2-tools,tpm2-abrmd,p11-kit,opensc,libpam-u2f,fido2-tools,libfido2-1,gnutls-bin,libnss3-tools,containerd,docker.io,qemu-system-x86,qemu-utils,libvirt-daemon-system,libvirt-clients,ovmf,seabios,ipxe-qemu,memtest86+,dosfstools,mtools"
+
+    debootstrap --arch="$ARCH" --variant=minbase --foreign \
+        --include="$PKGS" \
         "$SUITE" "$rootfs" "$MIRROR" || {
-        err "debootstrap failed"
+        err "debootstrap stage-1 (unpack) failed"
         exit 1
     }
+
+    info "Stage-1 unpack complete — running stage-2 configure in bind-mounted chroot..."
+    mount --bind /dev  "$rootfs/dev"
+    mount --bind /proc "$rootfs/proc"
+    mount --bind /sys  "$rootfs/sys"
+    # NOTE: never bind /run — chrooted postinsts would reach the HOST systemd
+    # via /run/systemd and hang WSL. policy-rc.d blocks service starts instead.
+    printf '#!/bin/sh\nexit 101\n' > "$rootfs/usr/sbin/policy-rc.d"
+    chmod +x "$rootfs/usr/sbin/policy-rc.d"
+
+    chroot "$rootfs" env DEBIAN_FRONTEND=noninteractive /debootstrap/debootstrap --second-stage || {
+        # Preserve the inner debootstrap log for forensics BEFORE cleanup wipes it
+        cp "$rootfs/debootstrap/debootstrap.log" "$(dirname "$OUTPUT")/debootstrap-error.log" 2>/dev/null || true
+        err "debootstrap stage-2 (configure) failed — inner log saved to $(dirname "$OUTPUT")/debootstrap-error.log"
+        exit 1
+    }
+
+    rm -f "$rootfs/usr/sbin/policy-rc.d"
+    umount -l "$rootfs/sys"  2>/dev/null || true
+    umount -l "$rootfs/proc" 2>/dev/null || true
+    umount -l "$rootfs/dev"  2>/dev/null || true
 
     ok "Base rootfs created"
 }
@@ -195,6 +226,14 @@ EOF
 
     # Enable services
     chroot "$rootfs" systemctl enable ssh nginx 2>/dev/null || true
+
+    # CRITICAL: regenerate initramfs so live-boot hooks are embedded —
+    # without this the ISO kernel panics (unable to mount root fs)
+    chroot "$rootfs" update-initramfs -u 2>/dev/null || {
+        warn "update-initramfs failed — retrying with -c"
+        kver=$(ls "$rootfs/lib/modules" | head -1)
+        chroot "$rootfs" update-initramfs -c -k "$kver" 2>/dev/null || true
+    }
 
     # Unmount
     umount -l "$rootfs/dev/pts" 2>/dev/null || true
@@ -391,6 +430,14 @@ stage_squash() {
     if [[ -f "$initrd" ]]; then
         cp "$initrd" "$WORK_DIR/live/initrd.img"
         ok "Initramfs copied"
+    fi
+
+    # MemTest86+ for the GRUB memory-test entry (BIOS boot only)
+    if [[ -f "$rootfs/boot/memtest86+.bin" ]]; then
+        cp "$rootfs/boot/memtest86+.bin" "$WORK_DIR/live/memtest86+"
+        ok "MemTest86+ included"
+    else
+        warn "memtest86+.bin not found — GRUB memtest entry will be inert"
     fi
 
     # Create squashfs with selected compression
