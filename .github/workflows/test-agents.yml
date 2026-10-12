@@ -1,4 +1,4 @@
-﻿name: Test Agents
+name: Test Agents
 on: [push, pull_request]
 jobs:
   test:
@@ -8,4 +8,9 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
       - run: pip install pytest httpx websockets psutil
-      - run: Get-ChildItem -Recurse -Filter *.py | ForEach-Object { python -m py_compile $_.FullName }
+      # Syntax-check every Python source. The previous step used
+      # PowerShell (Get-ChildItem | ForEach-Object) which does not exist
+      # on the Ubuntu runner's bash — it failed with exit 127 on every
+      # push. python -m compileall is the portable equivalent.
+      - name: Syntax-check all Python sources
+        run: python -m compileall -q .
