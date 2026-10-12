@@ -507,7 +507,13 @@ EMBEDEOF
     for c in /usr/lib/shim/shimx64.efi.signed /usr/lib/shim/shimx64.efi; do
         [[ -f "$c" ]] && shim="$c" && break
     done
-    for c in /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed \
+    # GRUB flavor matters: gcdx64.efi is the CD/removable-media build
+    # (what debian-cd uses). The plain grubx64.efi.signed disk flavor
+    # HANGS pre-display when chainloaded from optical media — verified
+    # by boot test on 2026-10-12 (plain UEFI and Secure Boot both spin
+    # at 100% CPU with no console; gcdx64 boots to the menu fine).
+    for c in /usr/lib/grub/x86_64-efi-signed/gcdx64.efi.signed \
+             /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed \
              /usr/lib/grub/x86_64-efi/monolithic/grubx64.efi; do
         [[ -f "$c" ]] && grub="$c" && break
     done
