@@ -90,7 +90,7 @@ check_root() {
 
 # ── Dependency Check ────────────────────────────────────────────────────────
 check_deps() {
-    local deps=("debootstrap" "grub-mkrescue" "xorriso" "mksquashfs" "curl" "mkfs.vfat" "mcopy")
+    local deps=("debootstrap" "grub-mkimage" "xorriso" "mksquashfs" "curl" "mkfs.vfat" "mcopy" "mmd")
     local missing=()
 
     for dep in "${deps[@]}"; do
@@ -462,58 +462,123 @@ stage_squash() {
 }
 
 # ── Stage 6: Build ISO ──────────────────────────────────────────────────────
+# Secure Boot strategy (debian-cd style):
+#   Firmware → MS-signed shim (BOOTX64.EFI) → Debian-signed GRUB (grubx64.efi)
+#            → trampoline grub.cfg in ESP → /boot/grub/grub.cfg on ISO9660
+# The signed GRUB verifies the kernel through shim; Debian stock kernels are
+# signed by the Debian Secure Boot CA embedded in shim, so the full chain
+# passes with factory Microsoft keys. If signed binaries are missing on the
+# build host we fall back to the unsigned monolithic GRUB (UEFI/BIOS boot
+# still works, Secure Boot will refuse — install shim-signed +
+# grub-efi-amd64-signed to fix).
 stage_build_iso() {
     info "STAGE 6/6: Building bootable ISO..."
 
-    # Create EFI boot image
+    local grub_i386="/usr/lib/grub/i386-pc"
+    [[ -d "$grub_i386" ]] || { err "grub-pc-bin not installed ($grub_i386 missing)"; exit 1; }
+
+    # ── 1. BIOS El Torito image (i386-pc, modules on ISO are fine unsigned) ──
+    mkdir -p "$WORK_DIR/boot/grub/i386-pc"
+    cp "$grub_i386"/*.mod "$grub_i386"/*.lst 2>/dev/null \
+        "$WORK_DIR/boot/grub/i386-pc/" || true
+
+    cat > "$WORK_DIR/efi/embed.cfg" <<'EMBEDEOF'
+search --no-floppy --set=root --file /live/vmlinuz
+set prefix=($root)/boot/grub
+configfile /boot/grub/grub.cfg
+EMBEDEOF
+
+    grub-mkimage -O i386-pc -d "$grub_i386" \
+        -o "$WORK_DIR/efi/core.img" \
+        -c "$WORK_DIR/efi/embed.cfg" \
+        biosdisk iso9660 || { err "grub-mkimage (BIOS) failed"; exit 1; }
+    cat "$grub_i386/cdboot.img" "$WORK_DIR/efi/core.img" \
+        > "$WORK_DIR/boot/grub/i386-pc/eltorito.img" || { err "eltorito.img build failed"; exit 1; }
+    ok "BIOS El Torito image created"
+
+    # ── 2. ESP image (FAT) with signed shim + GRUB ──────────────────────────
     local efi_img="$WORK_DIR/efi/efiboot.img"
-    mkdir -p "$WORK_DIR/efi"
     dd if=/dev/zero of="$efi_img" bs=1M count=64 2>/dev/null
-    mkfs.vfat "$efi_img" 2>/dev/null || true
+    mkfs.vfat "$efi_img" >/dev/null || { err "mkfs.vfat failed"; exit 1; }
 
-    # Copy GRUB EFI files
-    mkdir -p "$WORK_DIR/efi/boot"
-    if [[ -f /usr/lib/shim/shimx64.efi.signed ]]; then
-        cp /usr/lib/shim/shimx64.efi.signed "$WORK_DIR/efi/boot/bootx64.efi" 2>/dev/null || true
-        cp /usr/lib/shim/mmx64.efi "$WORK_DIR/efi/boot/mmx64.efi" 2>/dev/null || true
-    elif [[ -f /usr/lib/shim/shimx64.efi ]]; then
-        cp /usr/lib/shim/shimx64.efi "$WORK_DIR/efi/boot/bootx64.efi" 2>/dev/null || true
+    local shim="" grub="" mmx=""
+    local c
+    for c in /usr/lib/shim/shimx64.efi.signed /usr/lib/shim/shimx64.efi; do
+        [[ -f "$c" ]] && shim="$c" && break
+    done
+    for c in /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed \
+             /usr/lib/grub/x86_64-efi/monolithic/grubx64.efi; do
+        [[ -f "$c" ]] && grub="$c" && break
+    done
+    for c in /usr/lib/shim/mmx64.efi.signed /usr/lib/shim/mmx64.efi; do
+        [[ -f "$c" ]] && mmx="$c" && break
+    done
+
+    local secure_boot=false
+    if [[ "$shim" == *.signed && "$grub" == *.signed ]]; then
+        secure_boot=true
+        ok "Signed shim + GRUB found — Secure Boot chain ENABLED"
+    else
+        warn "Signed shim/GRUB not found — Secure Boot will REFUSE this ISO"
+        warn "Install 'shim-signed' and 'grub-efi-amd64-signed' to enable it"
+        [[ -z "$grub" ]] && { err "No grubx64.efi available at all"; exit 1; }
     fi
 
-    if [[ -f /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed ]]; then
-        cp /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed "$WORK_DIR/efi/boot/grubx64.efi" 2>/dev/null || true
-    elif [[ -f /usr/lib/grub/x86_64-efi/monolithic/grubx64.efi ]]; then
-        cp /usr/lib/grub/x86_64-efi/monolithic/grubx64.efi "$WORK_DIR/efi/boot/grubx64.efi" 2>/dev/null || true
+    mmd -i "$efi_img" ::/EFI ::/EFI/BOOT || { err "mmd failed"; exit 1; }
+    if [[ "$secure_boot" == true ]]; then
+        mcopy -i "$efi_img" "$shim" ::/EFI/BOOT/BOOTX64.EFI
+        mcopy -i "$efi_img" "$grub" ::/EFI/BOOT/grubx64.efi
+    else
+        mcopy -i "$efi_img" "$grub" ::/EFI/BOOT/BOOTX64.EFI
+    fi
+    [[ -n "$mmx" ]] && mcopy -i "$efi_img" "$mmx" ::/EFI/BOOT/mmx64.efi
+    if [[ -f /usr/lib/shim/fbx64.efi.signed ]]; then
+        mcopy -i "$efi_img" /usr/lib/shim/fbx64.efi.signed ::/EFI/BOOT/fbx64.efi
+        [[ -f /usr/lib/shim/BOOTX64.CSV ]] && \
+            mcopy -i "$efi_img" /usr/lib/shim/BOOTX64.CSV ::/EFI/BOOT/BOOTX64.CSV
     fi
 
-    # Build ISO with grub-mkrescue
-    grub-mkrescue \
+    # Trampoline grub.cfg: signed GRUB reads this from the ESP, then hops to
+    # the real menu on the ISO9660 filesystem.
+    cat > "$WORK_DIR/efi/grub.cfg.esp" <<'ESPEOF'
+search --no-floppy --set=live_root --file /live/vmlinuz
+set prefix=($live_root)/boot/grub
+configfile ($live_root)/boot/grub/grub.cfg
+ESPEOF
+    mcopy -i "$efi_img" "$WORK_DIR/efi/grub.cfg.esp" ::/EFI/BOOT/grub.cfg
+    ok "ESP image populated (shim chain: $secure_boot)"
+
+    # Mirror the EFI binaries onto the ISO9660 tree (some firmwares and
+    # manual copies look there; also matches previous KIRAT ISO layout).
+    mkdir -p "$WORK_DIR/EFI/BOOT"
+    mcopy -i "$efi_img" -s ::/EFI/BOOT "$WORK_DIR/EFI/BOOT-tmp" 2>/dev/null || true
+    if [[ -d "$WORK_DIR/EFI/BOOT-tmp" ]]; then
+        cp "$WORK_DIR/EFI/BOOT-tmp"/* "$WORK_DIR/EFI/BOOT/" 2>/dev/null || true
+        rm -rf "$WORK_DIR/EFI/BOOT-tmp"
+    fi
+
+    # ── 3. Assemble hybrid ISO (BIOS + UEFI + USB) with xorriso ─────────────
+    xorriso -as mkisofs \
+        -iso-level 3 \
+        -full-iso9660-filenames \
+        -volid "KIRAT-OS-${KIRAT_VERSION}" \
+        --grub2-mbr "$grub_i386/boot_hybrid.img" \
+        -partition_offset 16 \
+        --mbr-force-bootable \
+        -eltorito-catalog boot/grub/boot.cat \
+        -eltorito-boot boot/grub/i386-pc/eltorito.img \
+        -no-emul-boot \
+        -boot-load-size 4 \
+        -boot-info-table \
+        --grub2-boot-info \
+        -eltorito-alt-boot \
+        --efi-boot efi/efiboot.img \
+        -efi-boot-part --efi-boot-image \
+        -no-emul-boot \
+        -isohybrid-gpt-basdat \
+        -isohybrid-apm-hfsplus \
         -o "$OUTPUT" \
-        -V "KIRAT-OS-${KIRAT_VERSION}" \
-        --modules="part_gpt part_msdos fat iso9660 all_video gfxterm png" \
-        "$WORK_DIR" 2>/dev/null || {
-        # Fallback: use xorriso directly
-        xorriso -as mkisofs \
-            -iso-level 3 \
-            -full-iso9660-filenames \
-            -volid "KIRAT-OS-${KIRAT_VERSION}" \
-            -eltorito-boot boot/grub/grub.img \
-            -no-emul-boot \
-            -boot-load-size 4 \
-            -boot-info-table \
-            --eltorito-catalog boot/grub/boot.cat \
-            -eltorito-alt-boot \
-            -e efi/efiboot.img \
-            -no-emul-boot \
-            -isohybrid-gpt-basdat \
-            -isohybrid-apm-hfsplus \
-            -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
-            -output "$OUTPUT" \
-            "$WORK_DIR" 2>/dev/null || {
-            err "ISO build failed"
-            exit 1
-        }
-    }
+        "$WORK_DIR" || { err "ISO build failed (xorriso)"; exit 1; }
 
     ok "ISO built: $OUTPUT"
     info "Size: $(du -h "$OUTPUT" | cut -f1)"
