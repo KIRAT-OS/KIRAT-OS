@@ -1658,9 +1658,10 @@ EOF
 }
 
 parse_args() {
+    local disk_given=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --disk) TARGET_DISK="$2"; shift 2 ;;
+            --disk) TARGET_DISK="$2"; disk_given=true; shift 2 ;;
             --hostname) HOSTNAME="$2"; shift 2 ;;
             --username) USERNAME="$2"; shift 2 ;;
             --timezone) TIMEZONE="$2"; shift 2 ;;
@@ -1671,7 +1672,11 @@ parse_args() {
         esac
     done
 
-    if [ -z "$TARGET_DISK" ] || [ "$TARGET_DISK" = "/dev/sda" ]; then
+    # Require --disk explicitly. Do NOT reject /dev/sda when the user typed
+    # it — SATA disks are /dev/sda on most laptops/desktops. (The old check
+    # compared against the default value and rejected an explicit
+    # '--disk /dev/sda', found by installer boot test 2026-10-13.)
+    if [ "$disk_given" != true ]; then
         echo "ERROR: --disk is required."
         show_help
         exit 1

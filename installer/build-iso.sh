@@ -296,13 +296,25 @@ read -rp "Select option [1-4]: " choice
 
 case "$choice" in
     1)
-        sudo bash /opt/kirat-os-installer/install-native.sh --target auto --uefi --luks2 --harden
+        # install-native.sh takes --disk (no --target/--uefi/--luks2 flags
+        # exist — passing them fails with "Unknown option"). Auto-detect
+        # the first real disk (CD-ROM sr0 is TYPE=rom, excluded).
+        DISK=$(lsblk -dpn -o NAME,TYPE | awk '$2=="disk"{print $1; exit}')
+        if [ -z "$DISK" ]; then
+            echo "No installable disk found."
+            exit 1
+        fi
+        echo "Auto-detected target disk: $DISK"
+        sudo bash /opt/kirat-os-installer/install-native.sh --disk "$DISK"
         ;;
     2)
-        sudo bash /opt/kirat-os-installer/install-native.sh --interactive
+        lsblk -dpn -o NAME,SIZE,TYPE | grep -w disk
+        read -rp "Enter target disk (e.g., /dev/sda or /dev/nvme0n1): " DISK
+        sudo bash /opt/kirat-os-installer/install-native.sh --disk "$DISK"
         ;;
     3)
-        sudo bash /opt/kirat-os-installer/install-native.sh --dual-boot --target auto
+        echo "Dual boot is not automated yet: shrink your Windows partition"
+        echo "from Windows first, then use option 2 and pick the free disk."
         ;;
     *)
         echo "Installation cancelled."
