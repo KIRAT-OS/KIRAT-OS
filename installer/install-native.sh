@@ -389,7 +389,20 @@ RouteMetric=100
 EOF
 
     chroot "$INSTALL_MOUNT" systemctl enable systemd-networkd || log_warn "enable systemd-networkd failed (non-fatal)"
-    chroot "$INSTALL_MOUNT" systemctl enable systemd-resolved || log_warn "enable systemd-resolved failed (non-fatal)"
+    # systemd-resolved may not exist in the target (unit missing in minbase
+    # installs) — "systemctl enable" then errors hard. Guard it: enable only
+    # if the unit exists, otherwise fall back to a static /etc/resolv.conf.
+    if chroot "$INSTALL_MOUNT" systemctl cat systemd-resolved.service &>/dev/null; then
+        chroot "$INSTALL_MOUNT" systemctl enable systemd-resolved || log_warn "enable systemd-resolved failed (non-fatal)"
+    else
+        log_warn "systemd-resolved unit not present — writing static /etc/resolv.conf fallback"
+        rm -f "$INSTALL_MOUNT/etc/resolv.conf"
+        cat > "$INSTALL_MOUNT/etc/resolv.conf" << 'EOF'
+# KIRAT OS static DNS fallback (systemd-resolved unavailable in target)
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
+    fi
     # Root password (locked — emergency console only)
     chroot "$INSTALL_MOUNT" usermod -p "$(openssl passwd -6 "kirat-emergency-$(openssl rand -hex 8)")" root || log_warn "password set failed for root (non-fatal)"
     chroot "$INSTALL_MOUNT" passwd -l root
@@ -456,8 +469,24 @@ stage3b_rbac_setup() {
     # ── TIER 1: KIRAT-ADMIN — Full sudo, human administrator ──
     log_info "Creating Tier 1: kirat-admin..."
     chroot "$INSTALL_MOUNT" useradd -m -s /bin/bash -G sudo,docker,adm,systemd-journal,audio,video,netdev "kirat-admin" 2>/dev/null || true
-    chroot "$INSTALL_MOUNT" usermod -p "$(openssl passwd -6 'kirat-temp-change-me')" kirat-admin || log_warn "password set failed for kirat-admin (non-fatal)"
+    # Auto-generate the kirat-admin password and record it IMMEDIATELY on the
+    # target system. Previously it was only shown at final completion — an
+    # interrupted install stranded the admin (had to break in via init=/bin/bash).
+    ADMIN_PASSWORD="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-20)"
+    chroot "$INSTALL_MOUNT" usermod -p "$(openssl passwd -6 "$ADMIN_PASSWORD")" kirat-admin || log_warn "password set failed for kirat-admin (non-fatal)"
     chroot "$INSTALL_MOUNT" passwd -e kirat-admin || log_warn "passwd expiry for kirat-admin failed (non-fatal)"
+    cat > "$INSTALL_MOUNT/root/kirat-admin-credentials.txt" << EOF
+KIRAT OS — kirat-admin initial credentials
+==========================================
+Username: kirat-admin
+Password: $ADMIN_PASSWORD
+
+This password was auto-generated during installation.
+It is expired (passwd -e) and MUST be changed on first login.
+Delete this file after the first successful login.
+EOF
+    chmod 600 "$INSTALL_MOUNT/root/kirat-admin-credentials.txt"
+    log_ok "kirat-admin credentials saved to /root/kirat-admin-credentials.txt (mode 600)"
 
     # Admin sudoers: full access + can delegate to AI agents
     cat > "$INSTALL_MOUNT/etc/sudoers.d/kirat-admin" << 'EOF'
@@ -1245,10 +1274,22 @@ curl -fsSL -o /tmp/ollama-linux-amd64.tgz "https://ollama.com/download/ollama-li
 # Verify checksum if available (placeholder for real verification)
 # sha256sum -c /tmp/ollama-linux-amd64.tgz.sha256 || { echo "Checksum mismatch"; exit 1; }
 
-tar -xzf /tmp/ollama-linux-amd64.tgz -C "$INSTALL_DIR" 2>/dev/null || {
-    # Fallback: direct binary
-    curl -fsSL -o "$OLLAMA_BIN" "https://ollama.com/download/ollama-linux-amd64"
-    chmod +x "$OLLAMA_BIN"
+# The official tgz ships bin/ollama + lib/ — extract at /usr/local so the
+# binary lands at /usr/local/bin/ollama (extracting to /usr/local/bin put it
+# at bin/bin/ollama and forced the broken fallback below).
+tar -xzf /tmp/ollama-linux-amd64.tgz -C /usr/local 2>/dev/null || {
+    # Fallback: re-download from the current official URL and install the
+    # binary explicitly (the old .../ollama-linux-amd64 endpoint is 404).
+    echo "WARN: direct extract failed — retrying official tarball"
+    rm -rf /tmp/ollama-extract && mkdir -p /tmp/ollama-extract
+    curl -fsSL -o /tmp/ollama-linux-amd64.tgz "https://ollama.com/download/ollama-linux-amd64.tgz" && \
+    tar -xzf /tmp/ollama-linux-amd64.tgz -C /tmp/ollama-extract && \
+    if [ -f /tmp/ollama-extract/bin/ollama ]; then
+        install -m 0755 /tmp/ollama-extract/bin/ollama "$OLLAMA_BIN"
+    else
+        install -m 0755 /tmp/ollama-extract/ollama "$OLLAMA_BIN"
+    fi
+    rm -rf /tmp/ollama-extract
 }
 
 rm -f /tmp/ollama-linux-amd64.tgz

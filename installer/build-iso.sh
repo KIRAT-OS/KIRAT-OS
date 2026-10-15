@@ -138,7 +138,7 @@ stage_build_rootfs() {
     # /proc /sys /dev /run present — plain debootstrap chroot lacks them (WSL2).
     # Debian-bookworm-native packages only (docker-ce/kubectl/helm live in
     # third-party repos — debootstrap would fail; docker.io covers containers)
-    local PKGS="linux-image-amd64,live-boot,live-config,cryptsetup,lvm2,systemd,systemd-sysv,libpam-systemd,openssh-server,nginx,python3,python3-pip,postgresql,postgresql-contrib,ufw,fail2ban,auditd,apparmor,sysstat,htop,curl,wget,vim,nano,sudo,dbus,polkitd,ca-certificates,openssl,gnupg,apt-transport-https,net-tools,iputils-ping,dnsutils,iptables,ipset,wireguard-tools,qrencode,acl,attr,quota,quotatool,rsync,git,unzip,tar,gzip,bzip2,xz-utils,zstd,lz4,lzop,p7zip-full,lm-sensors,smartmontools,ethtool,pciutils,usbutils,cpufrequtils,thermald,dpkg-dev,build-essential,dkms,linux-headers-amd64,bc,bison,flex,libssl-dev,libelf-dev,fakeroot,debootstrap,squashfs-tools,xorriso,grub-pc-bin,grub-efi-amd64-bin,efibootmgr,mokutil,sbsigntool,tpm2-tools,tpm2-abrmd,p11-kit,opensc,libpam-u2f,fido2-tools,libfido2-1,gnutls-bin,libnss3-tools,containerd,docker.io,qemu-system-x86,qemu-utils,libvirt-daemon-system,libvirt-clients,ovmf,seabios,ipxe-qemu,memtest86+,dosfstools,mtools"
+    local PKGS="linux-image-amd64,live-boot,live-config,cryptsetup,lvm2,systemd,systemd-sysv,libpam-systemd,openssh-server,nginx,python3,python3-pip,postgresql,postgresql-contrib,ufw,fail2ban,auditd,apparmor,sysstat,htop,curl,wget,vim,nano,sudo,dbus,polkitd,ca-certificates,openssl,gnupg,apt-transport-https,net-tools,iputils-ping,dnsutils,iptables,ipset,wireguard-tools,qrencode,acl,attr,quota,quotatool,rsync,git,unzip,tar,gzip,bzip2,xz-utils,zstd,lz4,lzop,p7zip-full,lm-sensors,smartmontools,ethtool,pciutils,usbutils,cpufrequtils,thermald,dpkg-dev,build-essential,dkms,linux-headers-amd64,bc,bison,flex,libssl-dev,libelf-dev,fakeroot,debootstrap,squashfs-tools,xorriso,grub-pc-bin,grub-efi-amd64-bin,efibootmgr,mokutil,sbsigntool,tpm2-tools,tpm2-abrmd,p11-kit,opensc,libpam-u2f,fido2-tools,libfido2-1,gnutls-bin,libnss3-tools,containerd,docker.io,qemu-system-x86,qemu-utils,libvirt-daemon-system,libvirt-clients,ovmf,seabios,ipxe-qemu,memtest86+,dosfstools,mtools,parted,gdisk"
 
     debootstrap --arch="$ARCH" --variant=minbase --foreign \
         --include="$PKGS" \
@@ -224,8 +224,19 @@ ExecStart=
 ExecStart=-/sbin/agetty --autologin kirat --noclear %I $TERM
 EOF
 
-    # Enable services
-    chroot "$rootfs" systemctl enable ssh nginx 2>/dev/null || true
+    # DHCP networking for the live environment — without this the live
+    # system boots with NO network and must be configured manually
+    mkdir -p "$rootfs/etc/systemd/network"
+    cat > "$rootfs/etc/systemd/network/20-dhcp.network" << 'EOF'
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=yes
+EOF
+
+    # Enable services (networkd+resolved give the live env DHCP out of the box)
+    chroot "$rootfs" systemctl enable ssh nginx systemd-networkd systemd-resolved 2>/dev/null || true
 
     # CRITICAL: regenerate initramfs so live-boot hooks are embedded —
     # without this the ISO kernel panics (unable to mount root fs)
