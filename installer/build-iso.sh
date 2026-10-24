@@ -24,7 +24,7 @@
 set -euo pipefail
 
 readonly SCRIPT_VERSION="2.0.5"
-readonly KIRAT_VERSION="2.0.5"
+readonly KIRAT_VERSION="2.0.6"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly KIRAT_OS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -237,6 +237,21 @@ EOF
 
     # Enable services (networkd+resolved give the live env DHCP out of the box)
     chroot "$rootfs" systemctl enable ssh nginx systemd-networkd systemd-resolved 2>/dev/null || true
+    # Bulletproof fallback: chroot systemctl can silently skip units, which
+    # left the v2.0.5 live env WITHOUT DHCP (found in VM rehearsal). Create
+    # the wants-symlinks directly so networking is guaranteed on boot.
+    mkdir -p "$rootfs/etc/systemd/system/multi-user.target.wants"
+    for unit in ssh nginx systemd-networkd systemd-resolved; do
+        for base in /usr/lib/systemd/system /lib/systemd/system; do
+            if [ -e "$rootfs$base/${unit}.service" ]; then
+                ln -sf "$base/${unit}.service" \
+                    "$rootfs/etc/systemd/system/multi-user.target.wants/${unit}.service"
+                break
+            fi
+        done
+    done
+    # Point live-env DNS at the resolved stub (ignore if resolv.conf is managed)
+    ln -sf /run/systemd/resolve/stub-resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
 
     # CRITICAL: regenerate initramfs so live-boot hooks are embedded —
     # without this the ISO kernel panics (unable to mount root fs)
@@ -387,16 +402,6 @@ set title="KIRAT OS Server ${KIRAT_VERSION}"
 
 # ── Menu Entries ──────────────────────────────────────────────────────────
 
-menuentry "▶ Try KIRAT OS Live (Safe Mode)" --class kirat {
-    linux /live/vmlinuz boot=live components quiet splash
-    initrd /live/initrd.img
-}
-
-menuentry "▶ Try KIRAT OS Live (Forensic Mode - No Mount)" --class kirat {
-    linux /live/vmlinuz boot=live components quiet splash nomount
-    initrd /live/initrd.img
-}
-
 menuentry "▶ Install KIRAT OS (Standard - Full Disk)" --class installer {
     linux /live/vmlinuz boot=live components quiet splash kirat-install=auto
     initrd /live/initrd.img
@@ -409,6 +414,16 @@ menuentry "▶ Install KIRAT OS (Advanced - Interactive)" --class installer {
 
 menuentry "▶ Install KIRAT OS (Dual Boot with Windows)" --class installer {
     linux /live/vmlinuz boot=live components quiet splash kirat-install=dualboot
+    initrd /live/initrd.img
+}
+
+menuentry "▶ Try KIRAT OS Live (Safe Mode)" --class kirat {
+    linux /live/vmlinuz boot=live components quiet splash
+    initrd /live/initrd.img
+}
+
+menuentry "▶ Try KIRAT OS Live (Forensic Mode - No Mount)" --class kirat {
+    linux /live/vmlinuz boot=live components quiet splash nomount
     initrd /live/initrd.img
 }
 

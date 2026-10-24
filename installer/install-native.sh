@@ -27,7 +27,12 @@ BUSINESS_EMAIL="${BUSINESS_EMAIL:-admin@localhost}"
 DOMAIN="${DOMAIN:-localhost}"
 BUILD_DIR="/tmp/kirat-os-native-build"
 INSTALL_MOUNT="/mnt/kirat-os-root"
-KIRAT_VERSION="1.0.0-PRODUCTION"
+KIRAT_VERSION="2.0.6-PRODUCTION"
+
+# Resume support — stage markers live inside the target root so an
+# interrupted install (power loss, crash) can continue where it stopped.
+RESUME_MODE=false
+STAGE_MARKER="$INSTALL_MOUNT/var/lib/kirat-os/install-stage"
 
 # Post-Quantum Cryptography
 PQC_TLS="kyber768:x25519"
@@ -98,11 +103,16 @@ preflight() {
         die "No internet. Required to download packages and models."
     fi
 
-    # Check RAM
+    # Check RAM. MemTotal is what the kernel sees AFTER firmware and
+    # integrated-GPU reservations, so an "8GB" machine typically reports
+    # 7.4-7.9GiB here. Hard-fail below 7GiB, merely warn below 8.
     RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     RAM_GB=$((RAM_KB / 1024 / 1024))
+    if [ "$RAM_GB" -lt 7 ]; then
+        die "Insufficient RAM: ${RAM_GB}GB visible. Need 8GB installed (7GiB minimum after firmware reservations)."
+    fi
     if [ "$RAM_GB" -lt 8 ]; then
-        die "Insufficient RAM: ${RAM_GB}GB. Need 8GB minimum for production AI."
+        log_warn "RAM: ${RAM_GB}GB visible after firmware reservation (8GB installed recommended)"
     fi
     log_ok "RAM: ${RAM_GB}GB"
 
@@ -131,6 +141,105 @@ preflight() {
     fi
 
     log_ok "Pre-flight PASSED. Ready to build 100% operational KIRAT OS."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESUME SUPPORT — survive power loss / crashes mid-install
+# ─────────────────────────────────────────────────────────────────────────────
+# The installer records each completed stage in
+# $INSTALL_MOUNT/var/lib/kirat-os/install-stage. If the machine dies
+# mid-install, booting the ISO again and choosing Install detects the
+# existing LUKS volumes and offers to RESUME instead of wiping.
+
+derive_partitions() {
+    # Same layout stage1 creates. Called after parted (fresh) or on an
+    # existing disk (resume), so partitions always exist at call time.
+    if [ "$BOOT_MODE" = "UEFI" ]; then
+        EFI_PART="${TARGET_DISK}p1"; [ -b "$EFI_PART" ] || EFI_PART="${TARGET_DISK}1"
+        BOOT_PART="${TARGET_DISK}p2"; [ -b "$BOOT_PART" ] || BOOT_PART="${TARGET_DISK}2"
+        ROOT_PART="${TARGET_DISK}p3"; [ -b "$ROOT_PART" ] || ROOT_PART="${TARGET_DISK}3"
+        DATA_PART="${TARGET_DISK}p4"; [ -b "$DATA_PART" ] || DATA_PART="${TARGET_DISK}4"
+    else
+        EFI_PART=""
+        BOOT_PART="${TARGET_DISK}1"
+        ROOT_PART="${TARGET_DISK}2"
+        DATA_PART="${TARGET_DISK}3"
+    fi
+}
+
+detect_existing_install() {
+    derive_partitions
+    [ -b "${ROOT_PART:-/dev/null}" ] || return 1
+    [ "$(blkid -o value -s TYPE "$ROOT_PART" 2>/dev/null)" = "crypto_LUKS" ]
+}
+
+resume_mount_target() {
+    log_stage "RESUME: UNLOCKING EXISTING KIRAT OS INSTALLATION"
+
+    while true; do
+        read -s -p "Enter LUKS passphrase for the existing installation: " LUKS_PASS
+        echo ""
+        if printf '%s' "$LUKS_PASS" | cryptsetup open "$ROOT_PART" kirat-root --key-file - 2>/dev/null; then
+            break
+        fi
+        log_warn "Unlock failed (wrong passphrase?). Try again."
+    done
+    log_ok "Root volume unlocked"
+
+    # Data partition was encrypted with the SAME passphrase in stage 1
+    if [ "$(blkid -o value -s TYPE "${DATA_PART:-/dev/null}" 2>/dev/null)" = "crypto_LUKS" ]; then
+        printf '%s' "$LUKS_PASS" | cryptsetup open "$DATA_PART" kirat-data --key-file - 2>/dev/null \
+            && log_ok "Data volume unlocked" \
+            || log_warn "Data volume unlock failed — continuing without /data"
+    fi
+
+    mkdir -p "$INSTALL_MOUNT"
+    mount /dev/mapper/kirat-root "$INSTALL_MOUNT" \
+        || die "resume: cannot mount target root — the previous install was too early to resume. Re-run and choose fresh install."
+    mkdir -p "$INSTALL_MOUNT/boot"
+    mount "$BOOT_PART" "$INSTALL_MOUNT/boot" 2>/dev/null \
+        || log_warn "resume: /boot mount failed"
+    if [ -n "${EFI_PART:-}" ] && [ -b "$EFI_PART" ]; then
+        mkdir -p "$INSTALL_MOUNT/boot/efi"
+        mount "$EFI_PART" "$INSTALL_MOUNT/boot/efi" 2>/dev/null \
+            || log_warn "resume: EFI partition mount failed"
+    fi
+    if [ -e /dev/mapper/kirat-data ]; then
+        mkdir -p "$INSTALL_MOUNT/data"
+        mount /dev/mapper/kirat-data "$INSTALL_MOUNT/data" 2>/dev/null \
+            || log_warn "resume: /data mount failed"
+    fi
+
+    # Pseudo-filesystems for chroot stages
+    mkdir -p "$INSTALL_MOUNT/dev" "$INSTALL_MOUNT/proc" "$INSTALL_MOUNT/sys" "$INSTALL_MOUNT/run"
+    mountpoint -q "$INSTALL_MOUNT/dev"  || mount --bind /dev  "$INSTALL_MOUNT/dev"
+    mountpoint -q "$INSTALL_MOUNT/proc" || mount --bind /proc "$INSTALL_MOUNT/proc"
+    mountpoint -q "$INSTALL_MOUNT/sys"  || mount --bind /sys  "$INSTALL_MOUNT/sys"
+    mountpoint -q "$INSTALL_MOUNT/run"  || mount --bind /run  "$INSTALL_MOUNT/run"
+    cp -L /etc/resolv.conf "$INSTALL_MOUNT/etc/resolv.conf" 2>/dev/null || true
+
+    # Seed the marker: stage 1 provably completed (LUKS volumes exist and mount)
+    mkdir -p "$(dirname "$STAGE_MARKER")"
+    grep -qx stage1 "$STAGE_MARKER" 2>/dev/null || echo stage1 >> "$STAGE_MARKER"
+
+    RESUME_MODE=true
+    COMPLETED=$(wc -l < "$STAGE_MARKER" 2>/dev/null || echo 1)
+    log_ok "Resume mode active — $COMPLETED stage(s) already completed"
+}
+
+stage_done() {
+    [ -f "$STAGE_MARKER" ] && grep -qx "$1" "$STAGE_MARKER"
+}
+
+run_stage() {
+    local name="$1"; shift
+    if [ "$RESUME_MODE" = true ] && stage_done "$name"; then
+        log_info "Skipping $name — already completed (resume mode)"
+        return 0
+    fi
+    "$@"
+    mkdir -p "$(dirname "$STAGE_MARKER")"
+    echo "$name" >> "$STAGE_MARKER"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,6 +397,7 @@ postgresql,postgresql-contrib,\
 redis-server,\
 docker.io,containerd,\
 fail2ban,ufw,zstd,\
+console-setup,keyboard-configuration,\
 cryptsetup,cryptsetup-bin,\
 tpm2-tools,tpm2-abrmd,\
 sbsigntool,efitools,\
@@ -1743,18 +1853,38 @@ main() {
     echo ""
 
     preflight
-    stage1_partition
-    stage2_base_install
-    stage3_system_config
-    stage3b_rbac_setup
-    stage4_kernel_harden
-    stage5_security_stack
-    stage5b_ids_and_audit
-    stage6_business_stack
-    stage7_ai_backends
-    stage8_kirat_components
-    stage9_first_boot
-    stage10_finalize
+
+    # Resume offer — if this disk already holds an encrypted KIRAT OS
+    # installation, let the user continue an interrupted install instead
+    # of wiping everything.
+    if detect_existing_install; then
+        echo ""
+        log_warn "Existing encrypted KIRAT OS installation detected on $TARGET_DISK."
+        read -p "Resume the interrupted installation instead of wiping? [y/N]: " resume_ans
+        case "$resume_ans" in
+            y|Y|yes|YES|Yes)
+                resume_mount_target
+                ;;
+            *)
+                log_info "Fresh install chosen — ALL data on $TARGET_DISK will be destroyed."
+                ;;
+        esac
+    fi
+
+    if [ "$RESUME_MODE" != true ]; then
+        stage1_partition
+    fi
+    run_stage stage2  stage2_base_install
+    run_stage stage3  stage3_system_config
+    run_stage stage3b stage3b_rbac_setup
+    run_stage stage4  stage4_kernel_harden
+    run_stage stage5  stage5_security_stack
+    run_stage stage5b stage5b_ids_and_audit
+    run_stage stage6  stage6_business_stack
+    run_stage stage7  stage7_ai_backends
+    run_stage stage8  stage8_kirat_components
+    run_stage stage9  stage9_first_boot
+    run_stage stage10 stage10_finalize
 }
 
 main "$@"
