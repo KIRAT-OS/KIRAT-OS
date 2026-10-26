@@ -23,8 +23,8 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="2.0.5"
-readonly KIRAT_VERSION="2.0.6"
+readonly SCRIPT_VERSION="2.0.7"
+readonly KIRAT_VERSION="2.0.7"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly KIRAT_OS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -250,8 +250,16 @@ EOF
             fi
         done
     done
-    # Point live-env DNS at the resolved stub (ignore if resolv.conf is managed)
-    ln -sf /run/systemd/resolve/stub-resolv.conf "$rootfs/etc/resolv.conf" 2>/dev/null || true
+    # DNS: systemd-resolved is NOT present in the live rootfs (its unit is
+    # missing from the minbase package set — found in the v2.0.6 rehearsal
+    # when the live env booted with DHCP but zero DNS). Use static public
+    # resolvers; networkd still handles the interface via DHCP.
+    rm -f "$rootfs/etc/resolv.conf"
+    cat > "$rootfs/etc/resolv.conf" << 'EOF'
+# KIRAT OS live environment — static DNS (systemd-resolved unavailable)
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
 
     # CRITICAL: regenerate initramfs so live-boot hooks are embedded —
     # without this the ISO kernel panics (unable to mount root fs)
@@ -350,6 +358,23 @@ esac
 
 INSTALLER
     chmod +x "$rootfs/usr/local/bin/kirat-os-install"
+
+    # Auto-launch hook: the GRUB "Install" entries pass kirat-install=...
+    # on the kernel command line. Without this hook the flag was silently
+    # ignored and every entry just booted plain live mode (found in the
+    # v2.0.6 rehearsal). profile.d runs on the tty1 autologin shell.
+    cat > "$rootfs/etc/profile.d/kirat-autoinstall.sh" << 'EOF'
+# Auto-start the KIRAT OS installer when booted via a GRUB Install entry
+if grep -q 'kirat-install=' /proc/cmdline 2>/dev/null; then
+    if [ "$(tty 2>/dev/null)" = "/dev/tty1" ] && [ -z "${KIRAT_AUTOINSTALL_DONE:-}" ]; then
+        export KIRAT_AUTOINSTALL_DONE=1
+        echo ""
+        echo "KIRAT OS installer starting (booted with kirat-install flag)..."
+        sleep 2
+        /usr/local/bin/kirat-os-install
+    fi
+fi
+EOF
 
     # Create desktop entry for installer
     mkdir -p "$rootfs/usr/share/applications"

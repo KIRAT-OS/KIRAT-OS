@@ -27,7 +27,7 @@ BUSINESS_EMAIL="${BUSINESS_EMAIL:-admin@localhost}"
 DOMAIN="${DOMAIN:-localhost}"
 BUILD_DIR="/tmp/kirat-os-native-build"
 INSTALL_MOUNT="/mnt/kirat-os-root"
-KIRAT_VERSION="2.0.6-PRODUCTION"
+KIRAT_VERSION="2.0.7-PRODUCTION"
 
 # Resume support — stage markers live inside the target root so an
 # interrupted install (power loss, crash) can continue where it stopped.
@@ -176,37 +176,46 @@ detect_existing_install() {
 resume_mount_target() {
     log_stage "RESUME: UNLOCKING EXISTING KIRAT OS INSTALLATION"
 
-    while true; do
-        read -s -p "Enter LUKS passphrase for the existing installation: " LUKS_PASS
-        echo ""
-        if printf '%s' "$LUKS_PASS" | cryptsetup open "$ROOT_PART" kirat-root --key-file - 2>/dev/null; then
-            break
-        fi
-        log_warn "Unlock failed (wrong passphrase?). Try again."
-    done
-    log_ok "Root volume unlocked"
+    # Guard: a previous installer run may have left the mapper open
+    # (crash after unlock). Reuse it instead of failing in a loop.
+    if [ -e /dev/mapper/kirat-root ]; then
+        log_info "Root volume already unlocked — reusing"
+    else
+        while true; do
+            read -s -p "Enter LUKS passphrase for the existing installation: " LUKS_PASS
+            echo ""
+            if printf '%s' "$LUKS_PASS" | cryptsetup open "$ROOT_PART" kirat-root --key-file - 2>/dev/null; then
+                break
+            fi
+            log_warn "Unlock failed (wrong passphrase?). Try again."
+        done
+        log_ok "Root volume unlocked"
+    fi
 
     # Data partition was encrypted with the SAME passphrase in stage 1
-    if [ "$(blkid -o value -s TYPE "${DATA_PART:-/dev/null}" 2>/dev/null)" = "crypto_LUKS" ]; then
+    # (only attempt unlock if we actually prompted for a passphrase above)
+    if [ -e /dev/mapper/kirat-data ]; then
+        log_info "Data volume already unlocked — reusing"
+    elif [ -n "${LUKS_PASS:-}" ] && [ "$(blkid -o value -s TYPE "${DATA_PART:-/dev/null}" 2>/dev/null)" = "crypto_LUKS" ]; then
         printf '%s' "$LUKS_PASS" | cryptsetup open "$DATA_PART" kirat-data --key-file - 2>/dev/null \
             && log_ok "Data volume unlocked" \
             || log_warn "Data volume unlock failed — continuing without /data"
     fi
 
     mkdir -p "$INSTALL_MOUNT"
-    mount /dev/mapper/kirat-root "$INSTALL_MOUNT" \
+    mountpoint -q "$INSTALL_MOUNT" || mount /dev/mapper/kirat-root "$INSTALL_MOUNT" \
         || die "resume: cannot mount target root — the previous install was too early to resume. Re-run and choose fresh install."
     mkdir -p "$INSTALL_MOUNT/boot"
-    mount "$BOOT_PART" "$INSTALL_MOUNT/boot" 2>/dev/null \
+    mountpoint -q "$INSTALL_MOUNT/boot" || mount "$BOOT_PART" "$INSTALL_MOUNT/boot" 2>/dev/null \
         || log_warn "resume: /boot mount failed"
     if [ -n "${EFI_PART:-}" ] && [ -b "$EFI_PART" ]; then
         mkdir -p "$INSTALL_MOUNT/boot/efi"
-        mount "$EFI_PART" "$INSTALL_MOUNT/boot/efi" 2>/dev/null \
+        mountpoint -q "$INSTALL_MOUNT/boot/efi" || mount "$EFI_PART" "$INSTALL_MOUNT/boot/efi" 2>/dev/null \
             || log_warn "resume: EFI partition mount failed"
     fi
     if [ -e /dev/mapper/kirat-data ]; then
         mkdir -p "$INSTALL_MOUNT/data"
-        mount /dev/mapper/kirat-data "$INSTALL_MOUNT/data" 2>/dev/null \
+        mountpoint -q "$INSTALL_MOUNT/data" || mount /dev/mapper/kirat-data "$INSTALL_MOUNT/data" 2>/dev/null \
             || log_warn "resume: /data mount failed"
     fi
 
@@ -217,6 +226,20 @@ resume_mount_target() {
     mountpoint -q "$INSTALL_MOUNT/sys"  || mount --bind /sys  "$INSTALL_MOUNT/sys"
     mountpoint -q "$INSTALL_MOUNT/run"  || mount --bind /run  "$INSTALL_MOUNT/run"
     cp -L /etc/resolv.conf "$INSTALL_MOUNT/etc/resolv.conf" 2>/dev/null || true
+
+    # SELF-HEAL: an interrupted install almost always leaves dpkg
+    # mid-transaction — every later apt call then dies with "dpkg was
+    # interrupted". Repair before any stage touches packages.
+    log_info "Repairing package state after interruption..."
+    chroot "$INSTALL_MOUNT" /bin/bash -c '
+        export DEBIAN_FRONTEND=noninteractive
+        dpkg --configure -a || true
+        apt-get install -f -y -qq || true
+    ' || log_warn "package self-heal incomplete — continuing anyway"
+
+    # Remove stale AIDE database-in-progress: aide's postinst interactively
+    # asks to overwrite it, which would hang a resumed install.
+    rm -f "$INSTALL_MOUNT/var/lib/aide/aide.db.new" "$INSTALL_MOUNT/var/lib/aide/aide.db" 2>/dev/null || true
 
     # Seed the marker: stage 1 provably completed (LUKS volumes exist and mount)
     mkdir -p "$(dirname "$STAGE_MARKER")"
@@ -390,7 +413,7 @@ htop,iotop,ncdu,tree,rsync,git,\
 net-tools,iproute2,iptables,nftables,\
 dnsutils,ca-certificates,openssl,\
 parted,e2fsprogs,cryptsetup,cryptsetup-initramfs,\
-python3,python3-pip,python3-venv,python3-dev,python3-cryptography,python3-cffi-backend,\
+python3,python3-pip,python3-venv,python3-dev,python3-cryptography,python3-cffi-backend,python3-systemd,\
 build-essential,dkms,linux-headers-amd64,\
 nginx,certbot,python3-certbot-nginx,\
 postgresql,postgresql-contrib,\
@@ -1375,25 +1398,27 @@ set -euo pipefail
 INSTALL_DIR="/usr/local/bin"
 OLLAMA_BIN="$INSTALL_DIR/ollama"
 
-# Method 1: Try Debian package or direct binary download
-curl -fsSL -o /tmp/ollama-linux-amd64.tgz "https://ollama.com/download/ollama-linux-amd64.tgz" || {
+# Method 1: Direct binary tarball download.
+# IMPORTANT: upstream switched release assets from .tgz to .tar.zst in
+# v0.40+ — the old ollama.com/download/ollama-linux-amd64.tgz endpoint now
+# 404s (found in the v2.0.6 rehearsal). Download from GitHub releases.
+OLLAMA_URL="https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.tar.zst"
+curl -fsSL -o /tmp/ollama.tar.zst "$OLLAMA_URL" || {
     echo "WARN: Ollama download failed. Will retry post-boot."
     exit 0
 }
 
 # Verify checksum if available (placeholder for real verification)
-# sha256sum -c /tmp/ollama-linux-amd64.tgz.sha256 || { echo "Checksum mismatch"; exit 1; }
+# sha256sum -c /tmp/ollama.tar.zst.sha256 || { echo "Checksum mismatch"; exit 1; }
 
-# The official tgz ships bin/ollama + lib/ — extract at /usr/local so the
-# binary lands at /usr/local/bin/ollama (extracting to /usr/local/bin put it
-# at bin/bin/ollama and forced the broken fallback below).
-tar -xzf /tmp/ollama-linux-amd64.tgz -C /usr/local 2>/dev/null || {
-    # Fallback: re-download from the current official URL and install the
-    # binary explicitly (the old .../ollama-linux-amd64 endpoint is 404).
-    echo "WARN: direct extract failed — retrying official tarball"
+# The official tarball ships bin/ollama + lib/ollama — extract at /usr/local
+# so the binary lands at /usr/local/bin/ollama. tar auto-detects zstd when
+# the zstd package is installed (it is, via the base package list).
+tar -xf /tmp/ollama.tar.zst -C /usr/local 2>/dev/null || {
+    # Fallback: explicit zstd pipe, then install the binary by hand
+    echo "WARN: direct extract failed — retrying with explicit zstd pipe"
     rm -rf /tmp/ollama-extract && mkdir -p /tmp/ollama-extract
-    curl -fsSL -o /tmp/ollama-linux-amd64.tgz "https://ollama.com/download/ollama-linux-amd64.tgz" && \
-    tar -xzf /tmp/ollama-linux-amd64.tgz -C /tmp/ollama-extract && \
+    zstd -dc /tmp/ollama.tar.zst | tar -x -C /tmp/ollama-extract && \
     if [ -f /tmp/ollama-extract/bin/ollama ]; then
         install -m 0755 /tmp/ollama-extract/bin/ollama "$OLLAMA_BIN"
     else
@@ -1402,7 +1427,7 @@ tar -xzf /tmp/ollama-linux-amd64.tgz -C /usr/local 2>/dev/null || {
     rm -rf /tmp/ollama-extract
 }
 
-rm -f /tmp/ollama-linux-amd64.tgz
+rm -f /tmp/ollama.tar.zst
 '
     if [ -x "$INSTALL_MOUNT/usr/local/bin/ollama" ]; then
         log_ok "Ollama binary installed"
@@ -1423,6 +1448,9 @@ Group=ollama
 WorkingDirectory=/data/business
 Environment="OLLAMA_HOST=0.0.0.0:11434"
 Environment="OLLAMA_MODELS=/data/business/models"
+# Create the models directory as root (the "+" prefix) with ollama ownership:
+# User=ollama alone cannot mkdir under root-owned /data/business (v2.0.6 rehearsal bug).
+ExecStartPre=+/usr/bin/install -d -o ollama -g ollama /data/business/models
 ExecStart=/usr/local/bin/ollama serve
 Restart=always
 RestartSec=5
@@ -1432,6 +1460,47 @@ WantedBy=multi-user.target
 EOF
 
     chroot "$INSTALL_MOUNT" systemctl enable ollama || log_warn "enable ollama failed (non-fatal)"
+
+    # FIRST-BOOT SAFETY NET: if the binary download failed during install
+    # (offline mirror, upstream outage), this oneshot downloads it before
+    # ollama.service starts. Makes "will complete on first boot" real.
+    cat > "$INSTALL_MOUNT/usr/local/sbin/kirat-ollama-install" << 'EOF'
+#!/bin/bash
+# KIRAT OS — Ollama first-boot installer (idempotent)
+[ -x /usr/local/bin/ollama ] && exit 0
+URL="https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.tar.zst"
+curl -fsSL -o /tmp/ollama.tar.zst "$URL" || exit 1
+tar -xf /tmp/ollama.tar.zst -C /usr/local 2>/dev/null || {
+    rm -rf /tmp/ollama-extract && mkdir -p /tmp/ollama-extract
+    zstd -dc /tmp/ollama.tar.zst | tar -x -C /tmp/ollama-extract || exit 1
+    if [ -f /tmp/ollama-extract/bin/ollama ]; then
+        install -m 0755 /tmp/ollama-extract/bin/ollama /usr/local/bin/ollama
+    else
+        install -m 0755 /tmp/ollama-extract/ollama /usr/local/bin/ollama
+    fi
+    rm -rf /tmp/ollama-extract
+}
+rm -f /tmp/ollama.tar.zst
+[ -x /usr/local/bin/ollama ]
+EOF
+    chmod 755 "$INSTALL_MOUNT/usr/local/sbin/kirat-ollama-install"
+
+    cat > "$INSTALL_MOUNT/etc/systemd/system/ollama-install.service" << 'EOF'
+[Unit]
+Description=Ollama binary first-boot installer
+Before=ollama.service
+ConditionPathExists=!/usr/local/bin/ollama
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kirat-ollama-install
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chroot "$INSTALL_MOUNT" systemctl enable ollama-install || log_warn "enable ollama-install failed (non-fatal)"
+
     # Pre-pull models (will happen on first boot)
     cat > "$INSTALL_MOUNT/etc/systemd/system/ollama-pull.service" << 'EOF'
 [Unit]
@@ -1458,6 +1527,12 @@ EOF
     AI_PY_PKGS="fastapi uvicorn httpx websockets psutil numpy pynacl pycryptodome jinja2 python-multipart aiofiles python-dotenv slowapi redis python-socketio pydantic"
     chroot "$INSTALL_MOUNT" pip3 install --break-system-packages $AI_PY_PKGS 2>/dev/null \
         || log_warn "AI python deps incomplete — retry post-boot: pip3 install --break-system-packages $AI_PY_PKGS"
+    # CPU-only torch FIRST: stock PyPI torch pulls multi-GB NVIDIA CUDA wheels
+    # (cudnn/nccl/cusparselt...) that a headless server can never use — the
+    # v2.0.6 rehearsal downloaded ~1.5 GB of them. The CPU wheel is far smaller.
+    chroot "$INSTALL_MOUNT" pip3 install --break-system-packages \
+        torch --index-url https://download.pytorch.org/whl/cpu 2>/dev/null \
+        || log_warn "CPU torch install incomplete — whisper may pull GPU wheels"
     chroot "$INSTALL_MOUNT" pip3 install --break-system-packages openai-whisper 2>/dev/null \
         || log_warn "openai-whisper skipped (optional, large) — install post-boot if voice needed"
 
@@ -1478,31 +1553,47 @@ stage8_kirat_components() {
 
     mkdir -p "$INSTALL_MOUNT/opt/kirat-os"
 
-    # Copy current project files
+    # Copy current project files. Components may live beside the installer
+    # (dev checkout: ../<component>) or in the ISO live environment at
+    # /opt/kirat-os/<component> — support BOTH. v2.0.6 rehearsal bug: only the
+    # dev path was checked, so on ISO installs the code was never copied and
+    # sentinel/dashboard services failed with 200/CHDIR.
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [ -d "$SCRIPT_DIR/../quantum-ai" ]; then
-        cp -r "$SCRIPT_DIR/../quantum-ai" "$INSTALL_MOUNT/opt/kirat-os/"
+    if [ -d "$SCRIPT_DIR/../sentinel-core" ]; then
+        COMPONENT_ROOT="$SCRIPT_DIR/.."
+    elif [ -d /opt/kirat-os/sentinel-core ]; then
+        COMPONENT_ROOT="/opt/kirat-os"
+    else
+        COMPONENT_ROOT="$SCRIPT_DIR/.."
+    fi
+
+    if [ -d "$COMPONENT_ROOT/quantum-ai" ]; then
+        cp -r "$COMPONENT_ROOT/quantum-ai" "$INSTALL_MOUNT/opt/kirat-os/"
         log_ok "Quantum AI ecosystem installed"
     fi
 
-    if [ -d "$SCRIPT_DIR/../sentinel-core" ]; then
-        cp -r "$SCRIPT_DIR/../sentinel-core" "$INSTALL_MOUNT/opt/kirat-os/"
+    if [ -d "$COMPONENT_ROOT/sentinel-core" ]; then
+        cp -r "$COMPONENT_ROOT/sentinel-core" "$INSTALL_MOUNT/opt/kirat-os/"
         log_ok "Sentinel AI core installed"
+    else
+        log_warn "sentinel-core source NOT found — sentinel.service will fail"
     fi
 
-    if [ -d "$SCRIPT_DIR/../dashboard" ]; then
-        cp -r "$SCRIPT_DIR/../dashboard" "$INSTALL_MOUNT/opt/kirat-os/"
+    if [ -d "$COMPONENT_ROOT/dashboard" ]; then
+        cp -r "$COMPONENT_ROOT/dashboard" "$INSTALL_MOUNT/opt/kirat-os/"
         log_ok "Dashboard installed"
+    else
+        log_warn "dashboard source NOT found — kirat-dashboard.service will fail"
     fi
 
-    if [ -d "$SCRIPT_DIR/../security" ]; then
-        cp -r "$SCRIPT_DIR/../security" "$INSTALL_MOUNT/opt/kirat-os/"
+    if [ -d "$COMPONENT_ROOT/security" ]; then
+        cp -r "$COMPONENT_ROOT/security" "$INSTALL_MOUNT/opt/kirat-os/"
         log_ok "Security tools installed"
     fi
 
     # AI agents (5 defense + CEO) — REQUIRED for service install loop below (was missing — bug #9)
-    if [ -d "$SCRIPT_DIR/../ai-agents" ]; then
-        cp -r "$SCRIPT_DIR/../ai-agents" "$INSTALL_MOUNT/opt/kirat-os/"
+    if [ -d "$COMPONENT_ROOT/ai-agents" ]; then
+        cp -r "$COMPONENT_ROOT/ai-agents" "$INSTALL_MOUNT/opt/kirat-os/"
         log_ok "AI agents installed (jitedasti/galinja/oysgja/suyarma/papa/aadhipati)"
     else
         log_warn "ai-agents source dir NOT found — agent services will be skipped"
@@ -1707,8 +1798,17 @@ TTYPath=/dev/tty1
 WantedBy=multi-user.target
 EOF
 
-    chroot "$INSTALL_MOUNT" systemctl enable kirat-first-boot || log_warn "enable kirat-first-boot failed (non-fatal)"
-    log_ok "First-boot configuration ready"
+    # Do NOT auto-run the interactive wizard as a boot service: it shares
+    # tty1 with getty, receives SIGHUP and becomes a failed unit (v2.0.6
+    # rehearsal). Instead invite the admin to run it at first login.
+    chroot "$INSTALL_MOUNT" systemctl disable kirat-first-boot 2>/dev/null || true
+    cat > "$INSTALL_MOUNT/etc/profile.d/kirat-first-boot-reminder.sh" << 'EOF'
+# KIRAT OS — one-time first-boot setup reminder (interactive shells only)
+if [ "$(id -u)" = "0" ] && [ ! -f /var/lib/kirat-first-boot-done ]; then
+    echo "KIRAT OS: run 'sudo kirat-first-boot' to finish first-time setup (SSH keys, AI models)."
+fi
+EOF
+    log_ok "First-boot configuration ready (run: sudo kirat-first-boot)"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

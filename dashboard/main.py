@@ -282,15 +282,21 @@ class MetricsCollector:
     def get_process_metrics(self) -> Dict[str, int]:
         """Collect process metrics."""
         processes = list(psutil.process_iter(['pid', 'status']))
-        
-        zombie_count = sum(1 for p in processes if p.info['status'] == psutil.STATUS_ZOMBIE)
-        thread_count = sum(p.num_threads() for p in psutil.process_iter(['num_threads']))
-        
+
+        # p.info may lack 'status' if the process vanished mid-scan — use .get() (KeyError fix)
+        zombie_count = sum(1 for p in processes if p.info.get('status') == psutil.STATUS_ZOMBIE)
+        thread_count = 0
+        for p in psutil.process_iter(['num_threads']):
+            try:
+                thread_count += p.num_threads()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
         return {
             "total": len(processes),
             "threads": thread_count,
             "zombies": zombie_count,
-            "running": sum(1 for p in processes if p.info['status'] == psutil.STATUS_RUNNING)
+            "running": sum(1 for p in processes if p.info.get('status') == psutil.STATUS_RUNNING)
         }
     
     def get_ai_status(self) -> Dict[str, Any]:
@@ -441,7 +447,7 @@ async def metrics_broadcast_task():
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     """Serve the main dashboard page."""
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="index.html")
 
 @app.get("/api/health", response_model=HealthResponse)
 @limiter.limit("60/minute")
