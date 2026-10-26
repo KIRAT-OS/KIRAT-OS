@@ -90,7 +90,7 @@ check_root() {
 
 # ── Dependency Check ────────────────────────────────────────────────────────
 check_deps() {
-    local deps=("debootstrap" "grub-mkimage" "xorriso" "mksquashfs" "curl" "mkfs.vfat" "mcopy" "mmd")
+    local deps=("debootstrap" "grub-mkimage" "xorriso" "mksquashfs" "curl" "mkfs.vfat" "mcopy" "mmd" "rsync")
     local missing=()
 
     for dep in "${deps[@]}"; do
@@ -297,12 +297,23 @@ stage_include_installer() {
         warn "install-native.sh not found at $KIRAT_OS_DIR/scripts/install-native.sh"
     fi
 
-    # Copy KIRAT OS components
-    if [[ -d "$KIRAT_OS_DIR" ]]; then
-        rsync -a --exclude='.git' --exclude='*.iso' \
-            "$KIRAT_OS_DIR/" "$rootfs/opt/kirat-os/" 2>/dev/null || true
-        ok "KIRAT OS components copied to live environment"
-    fi
+    # Copy KIRAT OS components. Never hide copy failures: an ISO without
+    # these directories is bootable but cannot install a working AI stack.
+    local components_dir="$rootfs/opt/kirat-os"
+    mkdir -p "$components_dir"
+    rsync -a --exclude='.git' --exclude='*.iso' \
+        "$KIRAT_OS_DIR/" "$components_dir/" || {
+        err "Failed to copy KIRAT OS components"
+        exit 1
+    }
+    local component
+    for component in sentinel-core dashboard quantum-ai ai-agents security; do
+        [[ -d "$components_dir/$component" ]] || {
+            err "Required component missing from ISO rootfs: $component"
+            exit 1
+        }
+    done
+    ok "KIRAT OS components copied and verified"
 
     # Create installer launcher script
     cat > "$rootfs/usr/local/bin/kirat-os-install" << 'INSTALLER'
