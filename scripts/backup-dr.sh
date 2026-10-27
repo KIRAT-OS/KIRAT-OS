@@ -169,8 +169,13 @@ PY
     chmod 600 "$payload/MANIFEST.json"
 
     log_info "Creating one validated archive with secret exclusions..."
+    local -a tar_read_flags=()
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        log_warn "Non-root run: unreadable root-owned files will be skipped"
+        tar_read_flags+=(--ignore-failed-read)
+    fi
     local -a tar_cmd=(
-        tar -czf "$archive"
+        tar -czf "$archive" "${tar_read_flags[@]}"
         --exclude='etc/ssh/ssh_host_*'
         --exclude='*/id_rsa*' --exclude='*/id_ed25519*'
         --exclude='*.priv' --exclude='*.key' --exclude='*.pem'
