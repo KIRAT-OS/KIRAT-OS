@@ -138,9 +138,17 @@ action_backup() {
     done
 
     if command -v pg_dumpall >/dev/null 2>&1; then
-        log_info "Dumping PostgreSQL (failure is fatal)..."
-        runuser -u postgres -- pg_dumpall > "$payload/database/postgresql-all.sql"
-        chmod 600 "$payload/database/postgresql-all.sql"
+        if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+            log_info "Dumping PostgreSQL (failure is fatal)..."
+            runuser -u postgres -- pg_dumpall > "$payload/database/postgresql-all.sql"
+            chmod 600 "$payload/database/postgresql-all.sql"
+        elif pg_isready -q 2>/dev/null; then
+            log_info "Dumping PostgreSQL as current user (non-root)..."
+            pg_dumpall > "$payload/database/postgresql-all.sql"
+            chmod 600 "$payload/database/postgresql-all.sql"
+        else
+            log_warn "PostgreSQL not reachable as non-root; no dump included"
+        fi
     else
         log_warn "pg_dumpall unavailable; no PostgreSQL dump included"
     fi
