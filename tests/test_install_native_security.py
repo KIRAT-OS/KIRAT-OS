@@ -81,6 +81,10 @@ class InstallNativeSecurityTests(unittest.TestCase):
             "sudo -n /opt/kirat-os/security/rbac/executor-run.sh",
             "/opt/kirat-os/security/rbac/executed-ids",
             "chown -R root:root /opt/kirat-os/security/rbac",
+            '"instruction approve")',
+            'FILE="/var/lib/kirat-os/executor-requests/$AGENT-$ACTION.json"',
+            'chown root:ai-agents "$FILE"',
+            'chmod 640 "$FILE"',
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, self.text)

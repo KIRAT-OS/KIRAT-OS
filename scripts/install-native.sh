@@ -735,11 +735,42 @@ PY
         python3 "$RBAC/ed25519-sign.py" sign "$FILE"
         exec "$RBAC/executor-run.sh" "$FILE"
         ;;
+    "instruction approve")
+        shift 2
+        AGENT="${1:-}"; ACTION="${2:-}"; shift 2 || true
+        COMMAND="$*"
+        case "$AGENT" in galinja-ai|aadhipati-ai|papa-ai|suyarma-ai) ;; *) echo "Unsupported agent target" >&2; exit 1 ;; esac
+        [[ "$ACTION" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Invalid action name" >&2; exit 1; }
+        [ -n "$COMMAND" ] || { echo "Usage: kirat-admin instruction approve <agent> <action> <command>" >&2; exit 1; }
+        ID="inst-$(openssl rand -hex 16)"
+        FILE="/var/lib/kirat-os/executor-requests/$AGENT-$ACTION.json"
+        [ ! -e "$FILE" ] || { echo "Refusing to replace an existing approved request" >&2; exit 1; }
+        python3 - "$FILE" "$ID" "$AGENT" "$COMMAND" <<'PY'
+from datetime import datetime, timedelta, timezone
+import json, os, sys
+path, instruction_id, target, command = sys.argv[1:]
+now = datetime.now(timezone.utc).replace(microsecond=0)
+stamp = lambda value: value.strftime("%Y-%m-%dT%H:%M:%SZ")
+instruction = {
+    "instruction_id": instruction_id, "issuer": "kirat-admin", "target": target,
+    "command": command, "issued_at": stamp(now),
+    "expiry": stamp(now + timedelta(minutes=5)), "nonce": os.urandom(16).hex(),
+}
+with open(path, "x", encoding="utf-8") as stream:
+    json.dump(instruction, stream, ensure_ascii=False, allow_nan=False)
+    stream.write("\n")
+os.chmod(path, 0o600)
+PY
+        python3 "$RBAC/ed25519-sign.py" sign "$FILE"
+        chown root:ai-agents "$FILE"
+        chmod 640 "$FILE"
+        echo "Approved request installed: $FILE"
+        ;;
     "instruction list")
         ls -la "$RBAC/instructions"
         ;;
     *)
-        echo "Usage: kirat-admin instruction create <command> | instruction list" >&2
+        echo "Usage: kirat-admin instruction create <command> | instruction approve <agent> <action> <command> | instruction list" >&2
         exit 1
         ;;
 esac
