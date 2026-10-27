@@ -390,7 +390,7 @@ htop,iotop,ncdu,tree,rsync,git,\
 net-tools,iproute2,iptables,nftables,\
 dnsutils,ca-certificates,openssl,\
 parted,e2fsprogs,cryptsetup,cryptsetup-initramfs,\
-python3,python3-pip,python3-venv,python3-dev,python3-cryptography,python3-cffi-backend,python3-systemd,\
+python3,python3-pip,python3-venv,python3-dev,python3-cryptography,python3-cffi-backend,python3-systemd,python3-nacl,\
 build-essential,dkms,linux-headers-amd64,\
 nginx,certbot,python3-certbot-nginx,\
 postgresql,postgresql-contrib,\
@@ -1364,6 +1364,16 @@ stage8_kirat_components() {
         || die "Canonical public key is not a raw 32-byte Ed25519 key"
     [ -d "$COMPONENT_ROOT/ai-agents" ] || die "Required ai-agents source is missing"
     cp -r "$COMPONENT_ROOT/ai-agents" "$INSTALL_MOUNT/opt/kirat-os/"
+    [ -s "$INSTALL_MOUNT/opt/kirat-os/dashboard/requirements.txt" ] \
+        || die "Pinned dashboard/agent Python requirements are missing"
+    chroot "$INSTALL_MOUNT" python3 -m venv /opt/kirat-os/venv \
+        || die "Failed to create isolated AI runtime environment"
+    chroot "$INSTALL_MOUNT" /opt/kirat-os/venv/bin/pip install --no-cache-dir \
+        --requirement /opt/kirat-os/dashboard/requirements.txt \
+        || die "Failed to install pinned AI runtime dependencies"
+    chroot "$INSTALL_MOUNT" /opt/kirat-os/venv/bin/python -c \
+        'import fastapi, uvicorn, httpx, psutil, jinja2, slowapi, dotenv, redis' \
+        || die "Installed AI runtime dependencies failed import verification"
 
     # Runtime directories required by agent sandboxing (ReadWritePaths) and SQLite state.
     # Signed requests are read-only to agents; backup artifacts are root-only.
@@ -1424,7 +1434,7 @@ Environment="SENTINEL_HOST=127.0.0.1"
 Environment="SENTINEL_MODEL=gemma4:latest"
 Environment="SENTINEL_PORT=3000"
 Environment="PYTHONPATH=/opt/kirat-os"
-ExecStart=/usr/bin/python3 /opt/kirat-os/sentinel-core/main-real.py
+ExecStart=/opt/kirat-os/venv/bin/python /opt/kirat-os/sentinel-core/main-real.py
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
@@ -1464,8 +1474,13 @@ WorkingDirectory=/opt/kirat-os/dashboard
 EnvironmentFile=/etc/kirat-os/dashboard.env
 Environment="PYTHONPATH=/opt/kirat-os"
 Environment="SENTINEL_URL=http://127.0.0.1:3000"
-ExecStart=/usr/bin/python3 -m uvicorn main:app --host 127.0.0.1 --port 8080
+ExecStart=/opt/kirat-os/venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8080
 Restart=always
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target
@@ -1517,6 +1532,8 @@ stage10_finalize() {
     local required_files=(
         /opt/kirat-os/sentinel-core/main-real.py
         /opt/kirat-os/dashboard/main.py
+        /opt/kirat-os/dashboard/requirements.txt
+        /opt/kirat-os/venv/bin/python
         /opt/kirat-os/scripts/first-boot-wizard.sh
         /opt/kirat-os/scripts/backup-dr.sh
         /opt/kirat-os/security/rbac/ed25519-sign.py
@@ -1533,7 +1550,8 @@ stage10_finalize() {
     for required in "${required_files[@]}"; do
         [ -s "$INSTALL_MOUNT$required" ] || die "Final verification: required file missing or empty: $required"
     done
-    for service in ssh nginx postgresql redis-server docker ollama ollama-install sentinel kirat-dashboard ufw fail2ban apparmor; do
+    for service in ssh nginx postgresql redis-server docker ollama ollama-install sentinel kirat-dashboard \
+        jitedasti-ai galinja-ai oysgja-ai suyarma-ai papa-ai aadhipati-ai ufw fail2ban apparmor; do
         chroot "$INSTALL_MOUNT" systemctl is-enabled "$service" >/dev/null 2>&1 \
             || die "Final verification: required service is not enabled: $service"
     done

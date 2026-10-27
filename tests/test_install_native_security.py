@@ -134,6 +134,19 @@ class InstallNativeSecurityTests(unittest.TestCase):
         self.assertNotIn("ReadWritePaths=/opt/kirat-os /data/business", self.text)
         self.assertNotIn("QUANTUM_API_KEY=%s", self.text.replace("KIRAT_QUANTUM_ADMIN_API_KEY=%s", ""))
 
+    def test_native_ai_runtime_dependencies_are_installed_and_verified(self):
+        for expected in (
+            "python3-nacl",
+            "python3 -m venv /opt/kirat-os/venv",
+            "--requirement /opt/kirat-os/dashboard/requirements.txt",
+            "import fastapi, uvicorn, httpx, psutil, jinja2, slowapi, dotenv, redis",
+            "/opt/kirat-os/venv/bin/python",
+            "jitedasti-ai galinja-ai oysgja-ai suyarma-ai papa-ai aadhipati-ai",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, self.text)
+        self.assertNotIn("ExecStart=/usr/bin/python3", self.text)
+
     def test_first_boot_resume_and_final_verification(self):
         for expected in (
             "first-boot-wizard.sh backup-dr.sh",

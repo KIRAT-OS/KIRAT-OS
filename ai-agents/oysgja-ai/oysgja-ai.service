@@ -8,7 +8,7 @@ User=oysgja-ai
 Group=ai-agents
 WorkingDirectory=/opt/kirat-os/ai-agents/oysgja-ai
 Environment="PYTHONPATH=/opt/kirat-os/ai-agents"
-ExecStart=/usr/bin/python3 /opt/kirat-os/ai-agents/oysgja-ai/main.py
+ExecStart=/opt/kirat-os/venv/bin/python /opt/kirat-os/ai-agents/oysgja-ai/main.py
 Restart=always
 RestartSec=10
 

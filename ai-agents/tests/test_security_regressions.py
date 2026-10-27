@@ -239,6 +239,16 @@ class AadhipatiAndConfigurationTests(unittest.IsolatedAsyncioTestCase):
         for path, _ in oysgja.CanaryFiles.CANARIES:
             self.assertTrue(path.startswith("/tmp/") or path.startswith("/var/lib/kirat-os/"))
 
+    async def test_units_use_installed_runtime_and_permit_only_signed_sudo_agents(self):
+        for name in ("jitedasti-ai", "galinja-ai", "oysgja-ai", "suyarma-ai", "papa-ai", "aadhipati-ai"):
+            unit = (AGENTS_DIR / name / f"{name}.service").read_text(encoding="utf-8")
+            self.assertIn("ExecStart=/opt/kirat-os/venv/bin/python", unit)
+            self.assertNotIn("ReadWritePaths=/opt/kirat-os", unit)
+            if name in {"galinja-ai", "suyarma-ai", "papa-ai", "aadhipati-ai"}:
+                self.assertIn("NoNewPrivileges=false", unit)
+            else:
+                self.assertIn("NoNewPrivileges=true", unit)
+
     async def test_cli_has_no_legacy_core_unit_names(self):
         cli = (AGENTS_DIR / "kirat-agent").read_text(encoding="utf-8")
         self.assertIn("AGENTS=(jitedasti-ai galinja-ai oysgja-ai suyarma-ai papa-ai aadhipati-ai)", cli)

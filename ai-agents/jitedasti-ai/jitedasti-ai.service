@@ -10,7 +10,7 @@ Group=ai-agents
 WorkingDirectory=/opt/kirat-os/ai-agents/jitedasti-ai
 Environment="PYTHONPATH=/opt/kirat-os/ai-agents"
 Environment="OLLAMA_HOST=http://localhost:11434"
-ExecStart=/usr/bin/python3 /opt/kirat-os/ai-agents/jitedasti-ai/main.py
+ExecStart=/opt/kirat-os/venv/bin/python /opt/kirat-os/ai-agents/jitedasti-ai/main.py
 Restart=always
 RestartSec=10
 StartLimitInterval=60

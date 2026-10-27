@@ -13,7 +13,7 @@ Environment="OLLAMA_HOST=http://localhost:11434"
 Environment="AADHIPATI_VOICE_ENABLED=false"
 Environment="AADHIPATI_NEPALI_MODE=true"
 Environment="KIRAT_OS_ENABLE_DESTRUCTIVE_ACTIONS=false"
-ExecStart=/usr/bin/python3 /opt/kirat-os/ai-agents/aadhipati-ai/main.py
+ExecStart=/opt/kirat-os/venv/bin/python /opt/kirat-os/ai-agents/aadhipati-ai/main.py
 Restart=always
 RestartSec=10
 StartLimitInterval=60
@@ -23,7 +23,8 @@ LimitNOFILE=65536
 MemoryMax=2G
 CPUQuota=200%
 
-NoNewPrivileges=true
+# Allow setuid sudo solely for the canonical signed executor in sudoers.
+NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/kirat-os /data/business

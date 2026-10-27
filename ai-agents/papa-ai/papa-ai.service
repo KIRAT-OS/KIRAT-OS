@@ -9,7 +9,7 @@ Group=ai-agents
 WorkingDirectory=/opt/kirat-os/ai-agents/papa-ai
 Environment="PYTHONPATH=/opt/kirat-os/ai-agents"
 Environment="KIRAT_OS_ENABLE_DESTRUCTIVE_ACTIONS=false"
-ExecStart=/usr/bin/python3 /opt/kirat-os/ai-agents/papa-ai/main.py
+ExecStart=/opt/kirat-os/venv/bin/python /opt/kirat-os/ai-agents/papa-ai/main.py
 Restart=always
 RestartSec=10
 
@@ -17,10 +17,11 @@ LimitNOFILE=65536
 MemoryMax=256M
 CPUQuota=50%
 
-NoNewPrivileges=true
+# Allow setuid sudo solely for the canonical signed executor in sudoers.
+NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/kirat-os /var/log
+ReadWritePaths=/var/lib/kirat-os
 
 [Install]
 WantedBy=multi-user.target
