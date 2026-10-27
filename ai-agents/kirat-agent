@@ -1,0 +1,175 @@
+#!/bin/bash
+# KIRAT OS AI agent command interface. Privileged changes require signed instructions.
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; MAGENTA='\033[0;35m'; NC='\033[0m'; BOLD='\033[1m'
+AGENTS=(jitedasti-ai galinja-ai oysgja-ai suyarma-ai papa-ai aadhipati-ai)
+EXECUTOR=/opt/kirat-os/security/rbac/executor-run.sh
+INSTRUCTION_DIR=${KIRAT_OS_SIGNED_INSTRUCTION_DIR:-/var/lib/kirat-os/executor-requests}
+
+log_info()  { echo -e "${BLUE}[AGENT]${NC} $1"; }
+log_ok()    { echo -e "${GREEN}[OK]${NC}    $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[FAIL]${NC}   $1" >&2; }
+log_crit()  { echo -e "${MAGENTA}[CRIT]${NC}  $1"; }
+
+show_help() {
+    cat << 'EOF'
+Usage: kirat-agent COMMAND [ARGS]
+
+  status                    Show installed AI agent unit status (read-only)
+  jitedasti scan            Execute a signed jitedasti-ai scan request
+  galinja protect           Execute signed emergency isolation (after confirmation)
+  galinja restore           Execute signed normal-firewall restoration
+  galinja baseline          Create a local baseline under /var/lib/kirat-os
+  oysgja status             Show honeypot and canary status (read-only)
+  suyarma predict           Execute a signed prediction request
+  suyarma patch             Execute a signed emergency patch request
+  guardian check            Run read-only kernel/root checks
+  guardian protect          Execute signed immutable-file protection
+  all alert "message"       Write a local log alert (not inter-agent delivery)
+  all stop|start            Execute per-unit signed stop/start requests
+
+Signed requests live in /var/lib/kirat-os/executor-requests by default.
+Destructive agent automation also requires KIRAT_OS_ENABLE_DESTRUCTIVE_ACTIONS=true.
+EOF
+}
+
+run_signed() {
+    local action=$1
+    local instruction="$INSTRUCTION_DIR/$action.json"
+    if [[ ! -f "$instruction" || -L "$instruction" ]]; then
+        log_error "Signed instruction unavailable: $instruction"
+        return 1
+    fi
+    if [[ ! -x "$EXECUTOR" ]]; then
+        log_error "Canonical signed executor unavailable: $EXECUTOR"
+        return 1
+    fi
+    if (( EUID == 0 )); then
+        "$EXECUTOR" "$instruction"
+    else
+        sudo -n "$EXECUTOR" "$instruction"
+    fi
+}
+
+cmd_status() {
+    echo -e "${BOLD}AI Agent Status:${NC}"
+    for agent in "${AGENTS[@]}"; do
+        if systemctl is-active --quiet "$agent" 2>/dev/null; then
+            printf "  %-16s ${GREEN}● ACTIVE${NC}\n" "$agent"
+        else
+            printf "  %-16s ${RED}○ INACTIVE${NC}\n" "$agent"
+        fi
+        pid=$(systemctl show --property=MainPID --value "$agent" 2>/dev/null || echo "0")
+        printf "  %-16s PID: %s\n" "" "${pid:-N/A}"
+    done
+    echo -e "${BOLD}Core Services:${NC}"
+    for svc in sentinel ollama kirat-dashboard nginx ssh; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            printf "  %-20s ${GREEN}● ACTIVE${NC}\n" "$svc"
+        else
+            printf "  %-20s ${RED}○ INACTIVE${NC}\n" "$svc"
+        fi
+    done
+}
+
+cmd_galinja_protect() {
+    log_crit "Emergency isolation can block SSH and other network access."
+    read -r -p "Type PROTECT to continue: " confirm
+    [[ "$confirm" == "PROTECT" ]] || { log_warn "Aborted."; return 1; }
+    if run_signed galinja-ai-isolate; then
+        log_crit "Signed isolation instruction executed; verify firewall state."
+    else
+        log_error "Isolation was not performed."
+        return 1
+    fi
+}
+
+cmd_galinja_restore() {
+    if run_signed galinja-ai-restore-firewall; then
+        log_ok "Signed firewall restore instruction executed; verify firewall state."
+    else
+        log_error "Firewall was not restored."
+        return 1
+    fi
+}
+
+cmd_oysgja_status() {
+    echo "Fake SSH: port 2222"
+    echo "Fake HTTP: port 18081"
+    echo "Canaries: /tmp/kirat-oysgja-canary.env and /var/lib/kirat-os/oysgja-ai/canaries/"
+    for port in 2222 18081; do
+        if ss -tulpn 2>/dev/null | grep -q ":$port"; then
+            echo -e "  Port $port: ${GREEN}LISTENING${NC}"
+        else
+            echo -e "  Port $port: ${RED}NOT LISTENING${NC}"
+        fi
+    done
+}
+
+cmd_all_alert() {
+    local message=${1:-Manual alert from administrator}
+    logger -p auth.warning "KIRAT-AGENT-ALERT: $message"
+    log_warn "Alert written to the local system log; no inter-agent delivery is claimed."
+}
+
+cmd_all_units() {
+    local verb=$1
+    local failed=0
+    for agent in "${AGENTS[@]}"; do
+        if ! run_signed "aadhipati-ai-$verb-$agent"; then
+            log_error "Signed $verb request failed for $agent"
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+COMMAND=${1:-status}
+SUBCOMMAND=${2:-}
+ARG=${3:-}
+case "$COMMAND" in
+    status|"") cmd_status ;;
+    jitedasti)
+        [[ "$SUBCOMMAND" == "scan" ]] || { log_error "Unknown jitedasti command"; exit 1; }
+        run_signed aadhipati-ai-scan-jitedasti || { log_error "Scan was not triggered."; exit 1; }
+        log_ok "Signed jitedasti-ai scan instruction executed." ;;
+    galinja)
+        case "$SUBCOMMAND" in
+            protect) cmd_galinja_protect ;;
+            restore) cmd_galinja_restore ;;
+            baseline) python3 /opt/kirat-os/ai-agents/galinja-ai/main.py --create-baseline ;;
+            *) log_error "Unknown galinja command: $SUBCOMMAND"; exit 1 ;;
+        esac ;;
+    oysgja)
+        case "$SUBCOMMAND" in
+            status) cmd_oysgja_status ;;
+            reset) log_error "Honeypot reset is not implemented; no changes made."; exit 1 ;;
+            *) log_error "Unknown oysgja command: $SUBCOMMAND"; exit 1 ;;
+        esac ;;
+    suyarma)
+        case "$SUBCOMMAND" in
+            predict) run_signed suyarma-ai-predict && log_ok "Signed prediction instruction executed." ;;
+            patch) run_signed suyarma-ai-patch-kev && log_ok "Signed patch instruction executed." ;;
+            *) log_error "Unknown suyarma command: $SUBCOMMAND"; exit 1 ;;
+        esac ;;
+    papa)
+        log_error "Papa $SUBCOMMAND requires auditd integration and is not implemented; no action taken."
+        exit 1 ;;
+    guardian)
+        case "$SUBCOMMAND" in
+            check) python3 /opt/kirat-os/ai-agents/shared/guardian.py ;;
+            protect) run_signed galinja-ai-protect-files && log_ok "Signed file-protection instruction executed." ;;
+            *) log_error "Unknown guardian command: $SUBCOMMAND"; exit 1 ;;
+        esac ;;
+    all)
+        case "$SUBCOMMAND" in
+            alert) cmd_all_alert "$ARG" ;;
+            stop|start) cmd_all_units "$SUBCOMMAND" ;;
+            *) log_error "Unknown all command: $SUBCOMMAND"; exit 1 ;;
+        esac ;;
+    help|-h|--help) show_help ;;
+    *) log_error "Unknown command: $COMMAND"; show_help; exit 1 ;;
+esac

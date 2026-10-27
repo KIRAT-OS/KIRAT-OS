@@ -10,8 +10,8 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="KIRAT OS">
-    <link rel="manifest" href="/static/manifest.json">"stylesheet" href="/static/css/dashboard.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <link rel="manifest" href="/static/manifest.json">
+    <script src="/static/js/vendor/chart.umd.min.js"></script>
     <script src="/static/js/dashboard.js" defer></script>
 </head>
 <body class="scanlines">
@@ -92,7 +92,7 @@
                 <div class="thermal-value" id="thermalValue">--</div>
                 <div class="thermal-unit">°C</div>
             </div>
-            <div class="thermal-status normal" id="thermalStatus">normal</div>
+            <div class="thermal-status unavailable" id="thermalStatus">unavailable</div>
         </div>
 
         <!-- AI Status -->
@@ -102,8 +102,8 @@
                 <div class="card-subtitle">Runtime Status</div>
             </div>
             <div class="ai-status-container">
-                <div class="ai-status-indicator online" id="aiStatusIndicator">◈</div>
-                <div class="ai-status-text online" id="aiStatusText">ONLINE</div>
+                <div class="ai-status-indicator unavailable" id="aiStatusIndicator">◈</div>
+                <div class="ai-status-text unavailable" id="aiStatusText">UNAVAILABLE</div>
                 <div class="ai-metrics">
                     <div class="ai-metric">
                         <div class="ai-metric-value" id="aiRequests">--</div>

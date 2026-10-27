@@ -3,8 +3,9 @@
  * Handles live metrics streaming, chart updates, and UI interactions.
  */
 
-// Configuration
-const WS_URL = `ws://${window.location.host}/ws/metrics`;
+// Configuration: never use an unencrypted WebSocket from an HTTPS page.
+const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+const WS_PATH = `${WS_PROTOCOL}//${window.location.host}/ws/metrics`;
 const RECONNECT_INTERVAL = 3000;
 const MAX_RECONNECT_ATTEMPTS = 10;
 
@@ -224,31 +225,103 @@ function initCharts() {
     }
 }
 
-// WebSocket connection
-function connectWebSocket() {
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+// Browser authentication uses only an HttpOnly same-origin session cookie.
+let authenticationInProgress = false;
+
+async function clearSession() {
+    try {
+        await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+    } catch (error) {
+        console.warn('Session cleanup failed:', error);
+    }
+}
+
+async function promptForSession() {
+    while (true) {
+        const apiKey = prompt('Enter the dashboard API key:');
+        if (!apiKey) {
+            updateConnectionStatus('authentication required');
+            return false;
+        }
+
+        try {
+            const response = await fetch('/api/session', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${apiKey}` },
+                credentials: 'same-origin',
+                cache: 'no-store'
+            });
+            if (response.ok) return true;
+            if (response.status === 401 || response.status === 403) {
+                await clearSession();
+                alert('Authentication failed. Please enter the API key again.');
+                continue;
+            }
+            const data = await response.json().catch(() => ({}));
+            alert(`Session creation failed: ${data.error || response.status}`);
+            updateConnectionStatus('authentication failed');
+            return false;
+        } catch (error) {
+            console.error('Session creation failed:', error);
+            alert('Session creation failed. Check the dashboard connection.');
+            updateConnectionStatus('authentication failed');
+            return false;
+        }
+    }
+}
+
+async function ensureSession() {
+    try {
+        const response = await fetch('/api/session', {
+            credentials: 'same-origin',
+            cache: 'no-store'
+        });
+        if (response.ok) return true;
+        if (response.status !== 401 && response.status !== 403) {
+            updateConnectionStatus('authentication unavailable');
+            return false;
+        }
+    } catch (error) {
+        console.error('Session validation failed:', error);
+        updateConnectionStatus('authentication unavailable');
+        return false;
+    }
+
+    await clearSession();
+    return promptForSession();
+}
+
+async function connectWebSocket() {
+    if (authenticationInProgress ||
+        (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))) {
         return;
     }
 
+    authenticationInProgress = true;
+    let authenticated = false;
     try {
-        ws = new WebSocket(WS_URL);
+        authenticated = await ensureSession();
+    } finally {
+        authenticationInProgress = false;
+    }
+    if (!authenticated) return;
+
+    try {
+        ws = new WebSocket(WS_PATH);
 
         ws.onopen = () => {
             console.log('WebSocket connected');
             isConnected = true;
             reconnectAttempts = 0;
             updateConnectionStatus('connected');
-            
-            // Send subscription message
             ws.send(JSON.stringify({ type: 'subscribe' }));
         };
 
         ws.onmessage = (event) => {
             try {
-                const message = JSON.parse(event.data);
-                handleMessage(message);
-            } catch (e) {
-                console.error('Failed to parse message:', e);
+                handleMessage(JSON.parse(event.data));
+            } catch (error) {
+                console.error('Failed to parse message:', error);
             }
         };
 
@@ -258,14 +331,19 @@ function connectWebSocket() {
             updateConnectionStatus('disconnected');
         };
 
-        ws.onclose = () => {
+        ws.onclose = (event) => {
             console.log('WebSocket closed');
             isConnected = false;
             updateConnectionStatus('disconnected');
+            if (event.code === 1008) {
+                updateConnectionStatus('authentication expired');
+                clearSession().finally(connectWebSocket);
+                return;
+            }
             scheduleReconnect();
         };
-    } catch (e) {
-        console.error('Failed to create WebSocket:', e);
+    } catch (error) {
+        console.error('Failed to create WebSocket:', error);
         scheduleReconnect();
     }
 }
@@ -273,15 +351,15 @@ function connectWebSocket() {
 // Schedule reconnection
 function scheduleReconnect() {
     if (reconnectTimer) return;
-    
+
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
         console.error('Max reconnection attempts reached');
         return;
     }
-    
+
     reconnectAttempts++;
     console.log(`Reconnecting in ${RECONNECT_INTERVAL}ms (attempt ${reconnectAttempts})`);
-    
+
     reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         connectWebSocket();
@@ -447,20 +525,19 @@ function updateThermal(thermal) {
     const value = document.getElementById('thermalValue');
     const status = document.getElementById('thermalStatus');
     
-    const temp = thermal.cpu_temp || 0;
-    
-    if (icon) {
-        icon.textContent = temp > 70 ? '🔥' : temp > 50 ? '♨️' : '🌡️';
-    }
-    
+    const temp = thermal.cpu_temp;
+    const available = typeof temp === 'number';
+
+    if (icon) icon.textContent = '🌡️';
+
     if (value) {
-        value.textContent = temp.toFixed(1);
-        value.style.color = temp > 80 ? '#ef4444' : temp > 60 ? '#f59e0b' : '#10b981';
+        value.textContent = available ? temp.toFixed(1) : '--';
+        value.style.color = !available ? '#94a3b8' : temp > 80 ? '#ef4444' : temp > 60 ? '#f59e0b' : '#10b981';
     }
-    
+
     if (status) {
-        status.textContent = thermal.status || 'normal';
-        status.className = `thermal-status ${thermal.status || 'normal'}`;
+        status.textContent = thermal.status || 'unavailable';
+        status.className = `thermal-status ${thermal.status || 'unavailable'}`;
     }
 }
 
@@ -539,9 +616,9 @@ function updateAIStatus(ai) {
     }
     
     if (model) model.textContent = ai.model_loaded || 'N/A';
-    if (requests) requests.textContent = (ai.inference_requests_sec || 0).toFixed(1);
-    if (gpu) gpu.textContent = `${(ai.gpu_utilization || 0).toFixed(0)}%`;
-    if (batch) batch.textContent = ai.batch_size || 0;
+    if (requests) requests.textContent = typeof ai.inference_requests_sec === 'number' ? ai.inference_requests_sec.toFixed(1) : '--';
+    if (gpu) gpu.textContent = typeof ai.gpu_utilization === 'number' ? `${ai.gpu_utilization.toFixed(0)}%` : '--';
+    if (batch) batch.textContent = ai.batch_size ?? '--';
 }
 
 // Update Threats
@@ -550,7 +627,11 @@ function updateThreats(threats) {
     if (!container) return;
     
     container.innerHTML = '';
-    
+
+    if (!threats.length) {
+        container.textContent = 'Threat telemetry unavailable — no integration configured.';
+    }
+
     threats.forEach(threat => {
         const item = document.createElement('div');
         item.className = `threat-item ${threat.severity}`;
@@ -573,12 +654,17 @@ function updateThreats(threats) {
         container.appendChild(item);
     });
     
-    // Update threat count badge
+    // An empty unavailable feed must not be displayed as a green "all clear".
     const badge = document.getElementById('threatCount');
-    const activeCount = threats.filter(t => t.status === 'active').length;
     if (badge) {
-        badge.textContent = activeCount;
-        badge.style.color = activeCount > 0 ? '#ef4444' : '#10b981';
+        if (!threats.length) {
+            badge.textContent = '—';
+            badge.style.color = '#94a3b8';
+        } else {
+            const activeCount = threats.filter(t => t.status === 'active').length;
+            badge.textContent = activeCount;
+            badge.style.color = activeCount > 0 ? '#ef4444' : '#10b981';
+        }
     }
 }
 
@@ -588,14 +674,17 @@ function updateHoneypot(honeypot) {
     const total = document.getElementById('honeypotTotal');
     const blocked = document.getElementById('honeypotBlocked');
     const sessions = document.getElementById('honeypotSessions');
-    
-    if (total) total.textContent = honeypot.total_triggers.toLocaleString();
-    if (blocked) blocked.textContent = honeypot.blocked_ips.toLocaleString();
-    if (sessions) sessions.textContent = honeypot.active_sessions;
-    
+
+    if (total) total.textContent = honeypot.total_triggers ?? '--';
+    if (blocked) blocked.textContent = honeypot.blocked_ips ?? '--';
+    if (sessions) sessions.textContent = honeypot.active_sessions ?? '--';
+
     if (!container || !honeypot.honeypots) return;
-    
+
     container.innerHTML = '';
+    if (!honeypot.honeypots.length) {
+        container.textContent = honeypot.detail || 'Honeypot telemetry unavailable.';
+    }
     
     honeypot.honeypots.forEach(hp => {
         const item = document.createElement('div');
@@ -647,40 +736,47 @@ function formatBytes(bytes, decimals = 2) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
 
-// Send command to Sentinel (for future use)
+// Commands currently return 501 until a real authenticated integration exists.
 async function sendCommand(command, target = 'sentinel', params = {}) {
-    const apiKey = prompt('Enter API key:');
-    if (!apiKey) return;
-    
     try {
         const response = await fetch('/api/command', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`
-            },
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
             body: JSON.stringify({ command, target, params })
         });
-        
         const data = await response.json();
-        
+
+        if (response.status === 401 || response.status === 403) {
+            await clearSession();
+            updateConnectionStatus('authentication expired');
+            connectWebSocket();
+            return;
+        }
         if (response.ok) {
-            console.log('Command sent:', data);
-            alert(`Command queued: ${data.command_id}`);
+            console.log('Command result:', data);
+            alert(data.message || 'Command completed');
         } else {
             console.error('Command failed:', data);
             alert(`Error: ${data.error}`);
         }
-    } catch (e) {
-        console.error('Failed to send command:', e);
+    } catch (error) {
+        console.error('Failed to send command:', error);
         alert('Failed to send command');
     }
 }
 
-// Export for debugging
+async function logout() {
+    if (ws) ws.close();
+    await clearSession();
+    updateConnectionStatus('logged out');
+}
+
+// Export for debugging and explicit logout.
 window.dashboard = {
     ws,
     metricsHistory,
     sendCommand,
+    logout,
     formatBytes
 };

@@ -1,9 +1,7 @@
 #!/bin/bash
-# KIRAT OS — AI Agent Command Executor (Whitelisted + Ed25519 Verified)
-# Called by: executor-ai via sudo from orchestrator-ai validated instructions
-# Requires: Ed25519 signature verification BEFORE execution
-
+# KIRAT OS — exact-allowlist executor for canonical Ed25519 envelopes.
 set -euo pipefail
+umask 077
 
 ALLOWED_CMDS=(
     "systemctl status nginx"
@@ -44,111 +42,119 @@ ALLOWED_CMDS=(
     "fail2ban-client status"
 )
 
-INSTRUCTION_FILE="$1"
-if [ ! -f "$INSTRUCTION_FILE" ]; then
-    echo "ERROR: Instruction file not found" >&2
-    exit 1
-fi
-
-# Validate JSON structure
-if ! python3 -c "import json; json.load(open('$INSTRUCTION_FILE'))" 2>/dev/null; then
-    echo "ERROR: Invalid JSON instruction" >&2
-    exit 1
-fi
-
-CMD=$(python3 -c "import json; print(json.load(open('$INSTRUCTION_FILE')).get('command',''))")
-AGENT=$(python3 -c "import json; print(json.load(open('$INSTRUCTION_FILE')).get('agent',''))")
-SIG_B64=$(python3 -c "import json; print(json.load(open('$INSTRUCTION_FILE')).get('admin_signature',''))")
-SIG_ALG=$(python3 -c "import json; print(json.load(open('$INSTRUCTION_FILE')).get('signature_alg',''))")
-
-# Verify admin Ed25519 signature
-if [ -z "$SIG_B64" ] || [ -z "$SIG_ALG" ]; then
-    echo "ERROR: Missing admin signature or algorithm" >&2
-    exit 1
-fi
-
-if [ "$SIG_ALG" != "Ed25519" ]; then
-    echo "ERROR: Unsupported signature algorithm: $SIG_ALG (required: Ed25519)" >&2
-    exit 1
-fi
-
-PUB_KEY_PATH="/opt/kirat-os/security/rbac/admin-ed25519.pub"
-if [ ! -f "$PUB_KEY_PATH" ]; then
-    echo "ERROR: Ed25519 public key not found: $PUB_KEY_PATH" >&2
-    exit 1
-fi
-
-# Verify using Python (PyNaCl)
-VERIFY_RESULT=$(python3 << PYEOF
-import json, base64, sys
-try:
-    import nacl.signing
-except ImportError:
-    print("PYNACL_MISSING")
-    sys.exit(0)
-
-with open("$INSTRUCTION_FILE", "r") as f:
-    instruction = json.load(f)
-
-sig_b64 = instruction.pop("admin_signature", None)
-instruction.pop("signature_alg", None)
-instruction.pop("signed_at", None)
-
-if not sig_b64:
-    print("NO_SIG")
-    sys.exit(0)
-
-with open("$PUB_KEY_PATH", "rb") as f:
-    verify_key = nacl.signing.VerifyKey(f.read())
-
-payload = json.dumps(instruction, sort_keys=True, separators=(",", ":")).encode("utf-8")
-signature = base64.b64decode(sig_b64)
-
-try:
-    verify_key.verify(payload, signature)
-    print("VALID")
-except nacl.exceptions.BadSignatureError:
-    print("INVALID")
-PYEOF
+RBAC_DIR="${KIRAT_RBAC_DIR:-/opt/kirat-os/security/rbac}"
+EXPECTED_TARGET="${KIRAT_EXECUTOR_TARGET:-}"
+ALLOWED_TARGETS=(
+    "kirat-ai-executor" "jitedasti-ai" "galinja-ai" "oysgja-ai"
+    "suyarma-ai" "papa-ai" "aadhipati-ai"
 )
+EXPECTED_ISSUER="${KIRAT_EXECUTOR_ISSUER:-kirat-admin}"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SIGNER="$SCRIPT_DIR/ed25519-sign.py"
+LOG_DIR="$RBAC_DIR/logs"
+ID_DIR="$RBAC_DIR/executed-ids"
+WORK_DIR=""
+INSTRUCTION_ID="unknown"
+ISSUER="unknown"
+TARGET="unknown"
+CMD=""
 
-if [ "$VERIFY_RESULT" = "PYNACL_MISSING" ]; then
-    echo "ERROR: PyNaCl not installed. Cannot verify Ed25519 signature." >&2
+cleanup() {
+    [[ -z "$WORK_DIR" || ! -d "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
+}
+trap cleanup EXIT
+
+audit() {
+    local status="$1"
+    python3 - "$LOG_DIR/executor-audit.jsonl" "$status" "$INSTRUCTION_ID" \
+        "$ISSUER" "$TARGET" "$CMD" <<'PY'
+import datetime, json, os, sys
+path, status, instruction_id, issuer, target, command = sys.argv[1:]
+entry = {"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+         "instruction_id": instruction_id, "issuer": issuer, "target": target,
+         "command": command, "status": status}
+with open(path, "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(entry, sort_keys=True) + "\n")
+os.chmod(path, 0o600)
+PY
+}
+
+reject() {
+    local message="$1" status="${2:-REJECTED}"
+    printf 'ERROR: %s\n' "$message" >&2
+    audit "$status"
     exit 1
+}
+
+json_field() {
+    python3 - "$SNAPSHOT" "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    instruction = json.load(stream)
+value = instruction[sys.argv[2]]
+if not isinstance(value, str):
+    raise SystemExit("field is not a string")
+sys.stdout.write(value)
+PY
+}
+
+[[ $# -eq 1 ]] || { echo "Usage: executor-run.sh <instruction.json>" >&2; exit 1; }
+INSTRUCTION_FILE="$1"
+[[ -f "$INSTRUCTION_FILE" && -f "$SIGNER" ]] || {
+    echo "ERROR: Instruction or canonical verifier not found" >&2; exit 1; }
+
+mkdir -p -- "$LOG_DIR" "$ID_DIR"
+chmod 700 "$RBAC_DIR" "$LOG_DIR" "$ID_DIR"
+WORK_DIR=$(mktemp -d "$RBAC_DIR/.executor.XXXXXXXX")
+SNAPSHOT="$WORK_DIR/instruction.json"
+# Verify and execute one immutable private snapshot, not a mutable queue file.
+cp -- "$INSTRUCTION_FILE" "$SNAPSHOT"
+chmod 600 "$SNAPSHOT"
+
+if ! python3 "$SIGNER" verify "$SNAPSHOT"; then
+    reject "Canonical Ed25519, envelope, or freshness verification failed" "SIGNATURE_REJECTED"
+fi
+INSTRUCTION_ID=$(json_field instruction_id)
+ISSUER=$(json_field issuer)
+TARGET=$(json_field target)
+CMD=$(json_field command)
+
+[[ "$ISSUER" == "$EXPECTED_ISSUER" ]] || reject "Unexpected issuer" "ISSUER_REJECTED"
+if [[ -n "$EXPECTED_TARGET" ]]; then
+    [[ "$TARGET" == "$EXPECTED_TARGET" ]] || reject "Unexpected target" "TARGET_REJECTED"
+else
+    TARGET_ALLOWED=0
+    for allowed_target in "${ALLOWED_TARGETS[@]}"; do
+        [[ "$TARGET" == "$allowed_target" ]] && TARGET_ALLOWED=1 && break
+    done
+    [[ "$TARGET_ALLOWED" -eq 1 ]] || reject "Unexpected target" "TARGET_REJECTED"
 fi
 
-if [ "$VERIFY_RESULT" = "NO_SIG" ]; then
-    echo "ERROR: No signature found in instruction" >&2
-    exit 1
-fi
-
-if [ "$VERIFY_RESULT" != "VALID" ]; then
-    echo "ERROR: Ed25519 signature verification FAILED" >&2
-    # Log the failed attempt
-    LOG_ENTRY="{\"timestamp\":\"$(date -Iseconds)\",\"agent\":\"$AGENT\",\"command\":\"$CMD\",\"status\":\"SIGNATURE_REJECTED\"}"
-    echo "$LOG_ENTRY" >> /opt/kirat-os/security/rbac/logs/executor-audit.jsonl
-    exit 1
-fi
-
-# Whitelist check — must match EXACTLY (no wildcards)
 ALLOWED=0
-for prefix in "${ALLOWED_CMDS[@]}"; do
-    if [ "$CMD" = "$prefix" ]; then
+for allowed in "${ALLOWED_CMDS[@]}"; do
+    if [[ "$CMD" == "$allowed" ]]; then
         ALLOWED=1
         break
     fi
 done
+[[ "$ALLOWED" -eq 1 ]] || reject "Command not in exact allowlist: $CMD" "WHITELIST_REJECTED"
 
-if [ "$ALLOWED" -ne 1 ]; then
-    echo "ERROR: Command not in whitelist: $CMD" >&2
-    LOG_ENTRY="{\"timestamp\":\"$(date -Iseconds)\",\"agent\":\"$AGENT\",\"command\":\"$CMD\",\"status\":\"WHITELIST_REJECTED\"}"
-    echo "$LOG_ENTRY" >> /opt/kirat-os/security/rbac/logs/executor-audit.jsonl
-    exit 1
+# mkdir is the atomic compare-and-claim operation. A crash after this point
+# fails closed: the same signed instruction can never be executed twice.
+if ! mkdir -- "$ID_DIR/$INSTRUCTION_ID" 2>/dev/null; then
+    reject "Duplicate instruction ID: $INSTRUCTION_ID" "REPLAY_REJECTED"
 fi
+chmod 700 "$ID_DIR/$INSTRUCTION_ID"
+printf 'target=%s\nissuer=%s\ncommand=%s\n' "$TARGET" "$ISSUER" "$CMD" \
+    > "$ID_DIR/$INSTRUCTION_ID/claim"
+chmod 600 "$ID_DIR/$INSTRUCTION_ID/claim"
 
-# Log to auditor
-LOG_ENTRY="{\"timestamp\":\"$(date -Iseconds)\",\"agent\":\"$AGENT\",\"command\":\"$CMD\",\"signature_alg\":\"$SIG_ALG\",\"status\":\"EXECUTED\"}"
-echo "$LOG_ENTRY" >> /opt/kirat-os/security/rbac/logs/executor-audit.jsonl
-
-# Execute
-$CMD
+audit "ATTEMPTED"
+read -r -a CMD_ARGS <<< "$CMD"
+if "${CMD_ARGS[@]}"; then
+    audit "EXECUTED"
+else
+    status=$?
+    audit "COMMAND_FAILED"
+    exit "$status"
+fi

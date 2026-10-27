@@ -1,0 +1,32 @@
+[Unit]
+Description=KIRAT OS — Aadhipati AI (CEO & Sovereign)
+After=network-online.target ollama.service jitedasti-ai.service galinja-ai.service oysgja-ai.service suyarma-ai.service papa-ai.service
+Wants=ollama.service jitedasti-ai.service galinja-ai.service oysgja-ai.service suyarma-ai.service papa-ai.service
+
+[Service]
+Type=simple
+User=aadhipati-ai
+Group=ai-agents
+WorkingDirectory=/opt/kirat-os/ai-agents/aadhipati-ai
+Environment="PYTHONPATH=/opt/kirat-os/ai-agents"
+Environment="OLLAMA_HOST=http://localhost:11434"
+Environment="AADHIPATI_VOICE_ENABLED=false"
+Environment="AADHIPATI_NEPALI_MODE=true"
+Environment="KIRAT_OS_ENABLE_DESTRUCTIVE_ACTIONS=false"
+ExecStart=/usr/bin/python3 /opt/kirat-os/ai-agents/aadhipati-ai/main.py
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
+
+LimitNOFILE=65536
+MemoryMax=2G
+CPUQuota=200%
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/kirat-os /data/business
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+[Unit]
+Description=KIRAT OS — Healer AI (Self-Healing & Incident Response)
+After=network-online.target jitedasti-ai.service
+Wants=jitedasti-ai.service
+
+[Service]
+Type=simple
+User=galinja-ai
+Group=ai-agents
+WorkingDirectory=/opt/kirat-os/ai-agents/galinja-ai
+Environment="PYTHONPATH=/opt/kirat-os/ai-agents"
+Environment="KIRAT_OS_ENABLE_DESTRUCTIVE_ACTIONS=false"
+ExecStart=/usr/bin/python3 /opt/kirat-os/ai-agents/galinja-ai/main.py
+Restart=always
+RestartSec=10
+
+LimitNOFILE=65536
+MemoryMax=512M
+CPUQuota=50%
+
+# Healer needs elevated privileges for firewall and service management
+# It runs as a dedicated user with passwordless sudo for specific commands
+[Install]
+WantedBy=multi-user.target

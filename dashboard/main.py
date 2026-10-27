@@ -7,10 +7,11 @@ import os
 import time
 import json
 import asyncio
-import random
-import hashlib
-from datetime import datetime, timedelta
+import hmac
+import secrets
+from datetime import datetime
 from typing import Dict, List, Optional, Any
+from urllib.parse import urlsplit
 from contextlib import asynccontextmanager
 
 import psutil
@@ -29,12 +30,20 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Configuration
-API_KEY = os.getenv("DASHBOARD_API_KEY", "kirat-os-dev-key-2024")
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8000,http://127.0.0.1:8000").split(",")
+# Configuration. There is intentionally no development/default credential.
+API_KEY = os.getenv("DASHBOARD_API_KEY", "")
+CORS_ORIGINS = [origin.strip() for origin in os.getenv(
+    "CORS_ORIGINS", "http://localhost:3000,http://localhost:8000,http://127.0.0.1:8000"
+).split(",") if origin.strip()]
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-MAX_WS_CONNECTIONS = int(os.getenv("MAX_WS_CONNECTIONS", "100"))
+MAX_WS_CONNECTIONS = int(os.getenv("MAX_WS_CONNECTIONS", "50"))
 METRICS_INTERVAL = float(os.getenv("METRICS_INTERVAL", "1.0"))
+MAX_WS_MESSAGE_BYTES = 1024
+SESSION_COOKIE_NAME = "kirat_dashboard_session"
+SESSION_TTL_SECONDS = int(os.getenv("DASHBOARD_SESSION_TTL_SECONDS", "900"))
+MAX_SESSIONS = int(os.getenv("DASHBOARD_MAX_SESSIONS", "1000"))
+# Random token -> monotonic expiry. Sessions are intentionally memory-only.
+sessions: Dict[str, float] = {}
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -50,7 +59,7 @@ class ConnectionManager:
     
     async def connect(self, websocket: WebSocket):
         if len(self.active_connections) >= MAX_WS_CONNECTIONS:
-            await websocket.close(code=1008, reason="Server at capacity")
+            await websocket.close(code=1013, reason="Server at capacity")
             return False
         await websocket.accept()
         self.active_connections.append(websocket)
@@ -115,42 +124,8 @@ class MetricsCollector:
         self.network_last = psutil.net_io_counters()
         self.disk_last = psutil.disk_io_counters()
         self.last_time = time.time()
-        self.ai_requests_total = 0
+        # Integrations that do not exist remain empty/unavailable, never demo data.
         self.threat_history: List[Dict] = []
-        self.honeypot_triggers = 0
-        self._init_mock_data()
-    
-    def _init_mock_data(self):
-        """Initialize mock AI and threat data for demonstration."""
-        self.threat_history = [
-            {
-                "id": "THREAT-001",
-                "severity": "high",
-                "source": "honeypot-ssh",
-                "timestamp": datetime.now().isoformat(),
-                "description": "Brute force attack detected on SSH honeypot",
-                "ip": "192.168.1.100",
-                "status": "active"
-            },
-            {
-                "id": "THREAT-002", 
-                "severity": "medium",
-                "source": "audit-log",
-                "timestamp": (datetime.now() - timedelta(minutes=5)).isoformat(),
-                "description": "Unusual file access pattern detected",
-                "ip": "10.0.0.50",
-                "status": "investigating"
-            },
-            {
-                "id": "THREAT-003",
-                "severity": "low",
-                "source": "honeypot-http",
-                "timestamp": (datetime.now() - timedelta(minutes=15)).isoformat(),
-                "description": "Suspicious HTTP probe from unknown user agent",
-                "ip": "172.16.0.25",
-                "status": "resolved"
-            }
-        ]
     
     def get_cpu_metrics(self) -> Dict[str, Any]:
         """Collect CPU metrics."""
@@ -254,15 +229,18 @@ class MetricsCollector:
         except Exception:
             pass
         
-        # Fallback: generate synthetic temperature based on CPU load
-        cpu_load = psutil.cpu_percent(interval=None)
-        synthetic_temp = 35 + (cpu_load / 100) * 45 + random.uniform(-2, 2)
-        
+        cpu_temp = None
+        for name, entries in temps.items():
+            if any(marker in name.lower() for marker in ("cpu", "coretemp", "k10temp", "zenpower")) and entries:
+                cpu_temp = entries[0]["current"]
+                break
+
         return {
+            "available": cpu_temp is not None,
             "sensors": temps,
-            "cpu_temp": synthetic_temp,
+            "cpu_temp": cpu_temp,
             "unit": "celsius",
-            "status": "normal" if synthetic_temp < 70 else "warning" if synthetic_temp < 85 else "critical"
+            "status": "unavailable" if cpu_temp is None else "normal" if cpu_temp < 70 else "warning" if cpu_temp < 85 else "critical"
         }
     
     def get_load_metrics(self) -> Dict[str, float]:
@@ -300,57 +278,35 @@ class MetricsCollector:
         }
     
     def get_ai_status(self) -> Dict[str, Any]:
-        """Get AI runtime status (mock for demo)."""
-        self.ai_requests_total += random.randint(0, 5)
-        
-        statuses = ["online", "thinking", "idle", "busy"]
-        weights = [0.5, 0.2, 0.2, 0.1]
-        status = random.choices(statuses, weights=weights)[0]
-        
+        """Report honestly until an authenticated AI metrics integration exists."""
         return {
-            "status": status,
-            "inference_requests_sec": random.uniform(0, 50),
-            "total_requests": self.ai_requests_total,
-            "model_loaded": "sentinel-v2.1",
-            "gpu_utilization": random.uniform(10, 95),
-            "batch_size": random.randint(1, 32),
-            "last_inference": datetime.now().isoformat(),
-            "uptime": time.time() - self.start_time
+            "available": False,
+            "status": "unavailable",
+            "detail": "AI runtime metrics integration is not configured",
+            "inference_requests_sec": None,
+            "total_requests": None,
+            "model_loaded": None,
+            "gpu_utilization": None,
+            "batch_size": None,
+            "last_inference": None,
+            "uptime": None
         }
-    
+
     def get_threats(self) -> List[Dict[str, Any]]:
-        """Get active threats."""
-        # Simulate occasional new threats
-        if random.random() < 0.05:
-            new_threat = {
-                "id": f"THREAT-{len(self.threat_history) + 1:03d}",
-                "severity": random.choice(["low", "medium", "high", "critical"]),
-                "source": random.choice(["honeypot-ssh", "honeypot-http", "audit-log", "ids"]),
-                "timestamp": datetime.now().isoformat(),
-                "description": f"Automated threat detection event #{len(self.threat_history) + 1}",
-                "ip": f"10.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(0,255)}",
-                "status": "active"
-            }
-            self.threat_history.insert(0, new_threat)
-            if len(self.threat_history) > 50:
-                self.threat_history.pop()
-        
-        return self.threat_history[:10]
-    
+        """No threat feed is configured; an empty list is not a synthetic feed."""
+        return []
+
     def get_honeypot_metrics(self) -> Dict[str, Any]:
-        """Get honeypot activity metrics."""
-        self.honeypot_triggers += random.randint(0, 2)
-        
+        """Report honeypot telemetry as unavailable rather than inventing it."""
         return {
-            "total_triggers": self.honeypot_triggers,
-            "active_sessions": random.randint(0, 5),
-            "blocked_ips": random.randint(10, 200),
-            "last_trigger": datetime.now().isoformat() if self.honeypot_triggers > 0 else None,
-            "honeypots": [
-                {"name": "ssh-honeypot", "port": 2222, "status": "active", "triggers": random.randint(0, 50)},
-                {"name": "http-honeypot", "port": 8080, "status": "active", "triggers": random.randint(0, 30)},
-                {"name": "ftp-honeypot", "port": 2121, "status": "active", "triggers": random.randint(0, 20)}
-            ]
+            "available": False,
+            "status": "unavailable",
+            "detail": "Honeypot metrics integration is not configured",
+            "total_triggers": None,
+            "active_sessions": None,
+            "blocked_ips": None,
+            "last_trigger": None,
+            "honeypots": []
         }
     
     def get_all_metrics(self) -> Dict[str, Any]:
@@ -374,33 +330,97 @@ class MetricsCollector:
 collector = MetricsCollector()
 
 # API Key validation
+def api_key_matches(provided: Optional[str]) -> bool:
+    """Fail closed and compare credentials in constant time."""
+    return bool(API_KEY) and bool(provided) and hmac.compare_digest(
+        provided.encode("utf-8"), API_KEY.encode("utf-8")
+    )
+
+
 async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify API key for protected endpoints."""
+    """Require the long-term API key only when creating a browser session."""
+    if not API_KEY:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Dashboard API key is not configured")
     if not credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="API key required",
             headers={"WWW-Authenticate": "Bearer"}
         )
-    
-    # Simple comparison (in production, use constant-time comparison)
-    if credentials.credentials != API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid API key"
-        )
-    
+    if not api_key_matches(credentials.credentials):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid API key")
     return credentials.credentials
+
+
+def cleanup_expired_sessions(now: Optional[float] = None) -> None:
+    now = time.monotonic() if now is None else now
+    for token, expiry in list(sessions.items()):
+        if expiry <= now:
+            sessions.pop(token, None)
+
+
+def session_expiry(token: Optional[str]) -> Optional[float]:
+    if not token:
+        return None
+    expiry = sessions.get(token)
+    if expiry is None:
+        return None
+    if expiry <= time.monotonic():
+        sessions.pop(token, None)
+        return None
+    return expiry
+
+
+async def verify_access(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """Accept a Bearer key for CLI or an expiring HttpOnly session for browsers."""
+    if not API_KEY:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Dashboard API key is not configured")
+    if credentials:
+        if not api_key_matches(credentials.credentials):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Invalid API key")
+        return "bearer"
+    if session_expiry(request.cookies.get(SESSION_COOKIE_NAME)) is not None:
+        return "session"
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Valid session or Bearer API key required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def websocket_is_same_origin(websocket: WebSocket) -> bool:
+    """Reject cross-origin browser WebSockets (including missing Origin)."""
+    origin = websocket.headers.get("origin")
+    host = websocket.headers.get("host")
+    if not origin or not host:
+        return False
+    parsed = urlsplit(origin)
+    expected_scheme = "https" if websocket.url.scheme == "wss" else "http"
+    return parsed.scheme == expected_scheme and parsed.netloc.lower() == host.lower() and not parsed.path.strip("/")
+
+
+def websocket_is_authorized(websocket: WebSocket) -> bool:
+    authorization = websocket.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        return api_key_matches(authorization[7:])
+    return session_expiry(websocket.cookies.get(SESSION_COOKIE_NAME)) is not None
 
 # Lifespan context manager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan handler."""
-    # Startup
-    asyncio.create_task(metrics_broadcast_task())
-    yield
-    # Shutdown
-    pass
+    """Run and cleanly cancel the bounded metrics broadcaster."""
+    task = asyncio.create_task(metrics_broadcast_task())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 # Create FastAPI app
 app = FastAPI(
@@ -449,6 +469,53 @@ async def dashboard(request: Request):
     """Serve the main dashboard page."""
     return templates.TemplateResponse(request=request, name="index.html")
 
+@app.post("/api/session")
+@limiter.limit("10/minute")
+async def create_session(request: Request, _api_key: str = Depends(verify_api_key)):
+    """Exchange a Bearer API key for a short-lived, server-side session."""
+    cleanup_expired_sessions()
+    if len(sessions) >= MAX_SESSIONS:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Session capacity reached")
+    token = secrets.token_urlsafe(32)
+    sessions[token] = time.monotonic() + SESSION_TTL_SECONDS
+    response = JSONResponse(
+        {"authenticated": True, "expires_in": SESSION_TTL_SECONDS},
+        headers={"Cache-Control": "no-store"},
+    )
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        token,
+        max_age=SESSION_TTL_SECONDS,
+        expires=SESSION_TTL_SECONDS,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="strict",
+    )
+    return response
+
+
+@app.get("/api/session")
+async def session_status(_auth: str = Depends(verify_access)):
+    """Allow the browser to reuse an existing valid cookie without prompting."""
+    return JSONResponse({"authenticated": True}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/logout")
+async def logout(request: Request):
+    """Revoke the server-side token and expire the browser cookie."""
+    sessions.pop(request.cookies.get(SESSION_COOKIE_NAME), None)
+    response = JSONResponse({"authenticated": False}, headers={"Cache-Control": "no-store"})
+    response.delete_cookie(
+        SESSION_COOKIE_NAME,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="strict",
+    )
+    return response
+
+
 @app.get("/api/health", response_model=HealthResponse)
 @limiter.limit("60/minute")
 async def health_check(request: Request):
@@ -463,24 +530,27 @@ async def health_check(request: Request):
 
 @app.get("/api/metrics")
 @limiter.limit("30/minute")
-async def get_metrics(request: Request):
+async def get_metrics(request: Request, _key: str = Depends(verify_access)):
     """Get current system metrics snapshot."""
     return collector.get_all_metrics()
 
 @app.get("/api/ai-status")
 @limiter.limit("30/minute")
-async def get_ai_status(request: Request):
+async def get_ai_status(request: Request, _key: str = Depends(verify_access)):
     """Get Sentinel AI runtime status."""
     return collector.get_ai_status()
 
 @app.get("/api/threats")
 @limiter.limit("30/minute")
-async def get_threats(request: Request):
-    """Get active threat alerts."""
+async def get_threats(request: Request, _key: str = Depends(verify_access)):
+    """Return no events and an explicit unavailable state without a real feed."""
     return {
-        "threats": collector.get_threats(),
-        "total_active": sum(1 for t in collector.threat_history if t.get("status") == "active"),
-        "last_updated": datetime.now().isoformat()
+        "available": False,
+        "status": "unavailable",
+        "detail": "Threat metrics integration is not configured",
+        "threats": [],
+        "total_active": None,
+        "last_updated": None
     }
 
 @app.post("/api/command")
@@ -488,56 +558,49 @@ async def get_threats(request: Request):
 async def send_command(
     request: Request,
     command: CommandRequest,
-    api_key: str = Depends(verify_api_key)
+    api_key: str = Depends(verify_access)
 ):
-    """Send command to Sentinel AI (protected by API key)."""
-    
-    # Log command for audit
-    command_hash = hashlib.sha256(
-        f"{command.command}:{command.target}:{time.time()}".encode()
-    ).hexdigest()[:16]
-    
-    # Simulate command processing
-    response = {
-        "success": True,
-        "command_id": command_hash,
-        "command": command.command,
-        "target": command.target,
-        "status": "queued",
-        "timestamp": datetime.now().isoformat(),
-        "message": f"Command '{command.command}' queued for execution on {command.target}"
-    }
-    
-    return response
+    """Never claim queueing without a real authenticated Sentinel integration."""
+    raise HTTPException(
+        status.HTTP_501_NOT_IMPLEMENTED,
+        "Command execution is unavailable: no authenticated Sentinel integration is configured"
+    )
 
 @app.websocket("/ws/metrics")
 async def websocket_metrics(websocket: WebSocket):
-    """WebSocket endpoint for real-time metrics streaming."""
+    """Authenticated, same-origin, bounded real-time metrics streaming."""
+    if not API_KEY:
+        await websocket.close(code=1008, reason="Dashboard API key is not configured")
+        return
+    if not websocket_is_same_origin(websocket):
+        await websocket.close(code=1008, reason="Same-origin connection required")
+        return
+    if not websocket_is_authorized(websocket):
+        await websocket.close(code=1008, reason="Invalid or expired session")
+        return
+
+    authorization = websocket.headers.get("authorization", "")
+    browser_session_token = None if authorization else websocket.cookies.get(SESSION_COOKIE_NAME)
     connected = await manager.connect(websocket)
     if not connected:
         return
-    
+
     try:
-        # Send initial metrics immediately
         initial_metrics = collector.get_all_metrics()
-        await websocket.send_json({
-            "type": "metrics",
-            "data": initial_metrics
-        })
-        
-        # Keep connection alive and handle client messages
+        await websocket.send_json({"type": "metrics", "data": initial_metrics})
+
         while True:
+            if browser_session_token and session_expiry(browser_session_token) is None:
+                await websocket.close(code=1008, reason="Session expired or revoked")
+                break
             try:
-                message = await asyncio.wait_for(
-                    websocket.receive_text(),
-                    timeout=30.0
-                )
-                
-                # Handle client messages (ping, subscription changes, etc.)
+                message = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                if len(message.encode("utf-8")) > MAX_WS_MESSAGE_BYTES:
+                    await websocket.close(code=1009, reason="Message too large")
+                    break
                 try:
                     data = json.loads(message)
                     msg_type = data.get("type", "")
-                    
                     if msg_type == "ping":
                         await websocket.send_json({"type": "pong", "timestamp": time.time()})
                     elif msg_type == "subscribe":
@@ -546,15 +609,11 @@ async def websocket_metrics(websocket: WebSocket):
                         await websocket.send_json({"type": "error", "message": "Unknown message type"})
                 except json.JSONDecodeError:
                     await websocket.send_json({"type": "error", "message": "Invalid JSON"})
-                    
             except asyncio.TimeoutError:
-                # Send keepalive ping
                 await websocket.send_json({"type": "ping", "timestamp": time.time()})
-                
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
-    except Exception as e:
-        print(f"WebSocket error: {e}")
+        pass
+    finally:
         manager.disconnect(websocket)
 
 # Error handlers
@@ -567,13 +626,10 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(
-        status_code=500,
-        content={"error": "Internal server error", "detail": str(exc)}
-    )
+    return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
 if __name__ == "__main__":
     import uvicorn
     # SECURITY: reload=True is for development only. Production must use reload=False.
     reload_mode = ENVIRONMENT == "development"
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=reload_mode)
+    uvicorn.run("main:app", host="127.0.0.1", port=8080, reload=reload_mode)

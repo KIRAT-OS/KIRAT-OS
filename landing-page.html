@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KIRAT OS — The AI-Native Server Operating System</title>
+    <meta name="description" content="KIRAT OS is the world's first AI-native server operating system. Don't just run AI on your server. Let your server RUN AI for you.">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0e17;
+            color: #e2e8f0;
+            line-height: 1.6;
+        }
+        .container { max-width: 1200px; margin: 0 auto; padding: 0 24px; }
+        
+        /* Header */
+        header {
+            padding: 20px 0;
+            border-bottom: 1px solid #1e293b;
+            position: sticky; top: 0; background: rgba(10,14,23,0.95); backdrop-filter: blur(10px); z-index: 100;
+        }
+        .nav { display: flex; justify-content: space-between; align-items: center; }
+        .logo { font-size: 24px; font-weight: 800; color: #38bdf8; }
+        .logo span { color: #f472b6; }
+        .nav-links a { color: #94a3b8; text-decoration: none; margin-left: 32px; font-size: 15px; transition: color 0.2s; }
+        .nav-links a:hover { color: #38bdf8; }
+        
+        /* Hero */
+        .hero { padding: 100px 0 80px; text-align: center; }
+        .badge {
+            display: inline-block; background: rgba(56,189,248,0.1); color: #38bdf8;
+            padding: 6px 16px; border-radius: 20px; font-size: 14px; font-weight: 600; margin-bottom: 24px;
+            border: 1px solid rgba(56,189,248,0.3);
+        }
+        .hero h1 { font-size: 56px; font-weight: 800; line-height: 1.1; margin-bottom: 24px; }
+        .hero h1 .gradient { background: linear-gradient(135deg, #38bdf8, #f472b6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .hero .tagline { font-size: 22px; color: #94a3b8; max-width: 700px; margin: 0 auto 40px; }
+        .cta-group { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+        .btn {
+            padding: 14px 32px; border-radius: 8px; font-size: 16px; font-weight: 600;
+            text-decoration: none; transition: all 0.2s; cursor: pointer; border: none;
+        }
+        .btn-primary { background: #38bdf8; color: #0a0e17; }
+        .btn-primary:hover { background: #7dd3fc; transform: translateY(-2px); }
+        .btn-secondary { background: transparent; color: #e2e8f0; border: 1px solid #334155; }
+        .btn-secondary:hover { border-color: #38bdf8; color: #38bdf8; }
+        
+        /* Stats */
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 24px; padding: 40px 0; border-top: 1px solid #1e293b; border-bottom: 1px solid #1e293b; }
+        .stat { text-align: center; }
+        .stat-number { font-size: 36px; font-weight: 800; color: #38bdf8; }
+        .stat-label { font-size: 14px; color: #64748b; margin-top: 4px; }
+        
+        /* Sections */
+        section { padding: 80px 0; }
+        .section-header { text-align: center; margin-bottom: 60px; }
+        .section-header h2 { font-size: 40px; font-weight: 700; margin-bottom: 16px; }
+        .section-header p { font-size: 18px; color: #94a3b8; max-width: 600px; margin: 0 auto; }
+        
+        /* Problem/Solution */
+        .problem-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 60px; align-items: center; }
+        .problem-list { list-style: none; }
+        .problem-list li { padding: 12px 0; padding-left: 32px; position: relative; color: #cbd5e1; }
+        .problem-list li::before { content: "✗"; position: absolute; left: 0; color: #ef4444; font-weight: bold; }
+        .solution-list li::before { content: "✓"; color: #22c55e; }
+        
+        /* Features */
+        .features-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; }
+        .feature-card {
+            background: #0f172a; border: 1px solid #1e293b; border-radius: 12px;
+            padding: 32px; transition: all 0.2s;
+        }
+        .feature-card:hover { border-color: #38bdf8; transform: translateY(-4px); }
+        .feature-icon { font-size: 32px; margin-bottom: 16px; }
+        .feature-card h3 { font-size: 20px; margin-bottom: 8px; }
+        .feature-card p { color: #94a3b8; font-size: 15px; }
+        
+        /* Agents */
+        .agent-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
+        .agent-card {
+            background: linear-gradient(135deg, #0f172a, #1e1b4b); border: 1px solid #312e81;
+            border-radius: 12px; padding: 28px;
+        }
+        .agent-card h4 { color: #a5b4fc; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+        .agent-card .name { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+        .agent-card .desc { color: #94a3b8; font-size: 14px; }
+        
+        /* Code block */
+        .code-block {
+            background: #020617; border: 1px solid #1e293b; border-radius: 12px;
+            padding: 24px; font-family: 'SF Mono', Monaco, monospace; font-size: 14px;
+            overflow-x: auto; margin: 24px 0;
+        }
+        .code-block .comment { color: #64748b; }
+        .code-block .cmd { color: #38bdf8; }
+        .code-block .arg { color: #f472b6; }
+        
+        /* Comparison */
+        .compare-table { width: 100%; border-collapse: collapse; margin-top: 32px; }
+        .compare-table th { text-align: left; padding: 16px; background: #0f172a; color: #94a3b8; font-weight: 600; }
+        .compare-table td { padding: 16px; border-bottom: 1px solid #1e293b; }
+        .compare-table tr:hover td { background: #0f172a; }
+        .yes { color: #22c55e; font-weight: 600; }
+        .no { color: #ef4444; }
+        .partial { color: #f59e0b; }
+        
+        /* CTA Section */
+        .cta-section { text-align: center; background: linear-gradient(135deg, #0f172a, #1e1b4b); border-radius: 20px; padding: 80px 40px; margin: 40px 0; }
+        .cta-section h2 { font-size: 36px; margin-bottom: 16px; }
+        .cta-section p { color: #94a3b8; margin-bottom: 32px; }
+        
+        /* Footer */
+        footer { border-top: 1px solid #1e293b; padding: 40px 0; text-align: center; color: #64748b; font-size: 14px; }
+        footer a { color: #94a3b8; text-decoration: none; margin: 0 16px; }
+        footer a:hover { color: #38bdf8; }
+        
+        /* Mobile */
+        @media (max-width: 768px) {
+            .hero h1 { font-size: 36px; }
+            .hero .tagline { font-size: 18px; }
+            .problem-grid { grid-template-columns: 1fr; }
+            .nav-links { display: none; }
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="container nav">
+        <div class="logo">KIRAT<span>OS</span></div>
+        <nav class="nav-links">
+            <a href="#features">Features</a>
+            <a href="#agents">Agents</a>
+            <a href="#security">Security</a>
+            <a href="https://docs.kirat-os.org">Docs</a>
+            <a href="https://github.com/kirat-os">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<section class="hero">
+    <div class="container">
+        <div class="badge">🚀 Now in Public Beta</div>
+        <h1>The <span class="gradient">AI-Native</span><br>Server Operating System</h1>
+        <p class="tagline">Don't just run AI on your server. Let your server <strong>RUN AI for you</strong>. Autonomous threat hunting, self-healing infrastructure, and post-quantum security — built into the OS itself.</p>
+        <div class="cta-group">
+            <a href="https://github.com/kirat-os/kirat-os/releases" class="btn btn-primary">Download KIRAT OS 2.0</a>
+            <a href="https://docs.kirat-os.org" class="btn btn-secondary">Read Documentation</a>
+        </div>
+    </div>
+</section>
+
+<section style="padding: 0;">
+    <div class="container">
+        <div class="stats">
+            <div class="stat">
+                <div class="stat-number">6</div>
+                <div class="stat-label">Autonomous AI Agents</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number">PQC</div>
+                <div class="stat-label">Post-Quantum Crypto</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number">0</div>
+                <div class="stat-label">Cloud Dependencies</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number">100%</div>
+                <div class="stat-label">Open Source</div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section id="problem">
+    <div class="container">
+        <div class="section-header">
+            <h2>Running AI Infrastructure Is Broken</h2>
+            <p>Today's AI teams duct-tape together a dozen tools. KIRAT OS replaces the stack.</p>
+        </div>
+        <div class="problem-grid">
+            <div>
+                <h3 style="color: #ef4444; margin-bottom: 20px;">The Old Way</h3>
+                <ul class="problem-list">
+                    <li>Ubuntu + manual hardening scripts</li>
+                    <li>Separate monitoring (Prometheus/Grafana)</li>
+                    <li>Separate security (Wazuh, CrowdStrike)</li>
+                    <li>Manual CVE patching at 3 AM</li>
+                    <li>No AI-specific optimization</li>
+                    <li>Legacy crypto (RSA/ECC) — quantum-vulnerable</li>
+                </ul>
+            </div>
+            <div>
+                <h3 style="color: #22c55e; margin-bottom: 20px;">The KIRAT Way</h3>
+                <ul class="problem-list solution-list">
+                    <li>OS with security built in, not bolted on</li>
+                    <li>Real-time AI-powered monitoring dashboard</li>
+                    <li>6 autonomous agents that defend 24/7</li>
+                    <li>Predictive patching before exploits drop</li>
+                    <li>GPU-optimized for LLM inference</li>
+                    <li>Post-quantum crypto (Kyber + Dilithium)</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section id="features" style="background: #0f172a;">
+    <div class="container">
+        <div class="section-header">
+            <h2>Built for AI Workloads</h2>
+            <p>Every component is optimized for running, securing, and scaling AI infrastructure.</p>
+        </div>
+        <div class="features-grid">
+            <div class="feature-card">
+                <div class="feature-icon">🤖</div>
+                <h3>Autonomous AI Agents</h3>
+                <p>6 specialized agents — threat hunter, self-healer, deception engine, predictive patcher, biometric guardian, and CEO commander — work together to manage your infrastructure.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">⚡</div>
+                <h3>GPU-Optimized Inference</h3>
+                <p>Pre-configured CUDA, Docker GPU runtime, and Ollama integration. Deploy LLMs in minutes, not hours.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🔐</div>
+                <h3>Post-Quantum Security</h3>
+                <p>Hybrid TLS (Kyber768 + X25519), post-quantum SSH key exchange, and FIDO2 hardware key support — ready for the quantum era.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🛡️</div>
+                <h3>Self-Healing Infrastructure</h3>
+                <p>Galinja agent detects compromise, isolates the system, collects forensics, and restores from baseline — automatically.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">📊</div>
+                <h3>Real-Time AI Dashboard</h3>
+                <p>WebSocket-powered monitoring with AI status, threat alerts, honeypot triggers, and system metrics — accessible from any device.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🔮</div>
+                <h3>Predictive Patching</h3>
+                <p>Suyarma agent fetches CVE data, correlates with your installed packages, uses LLM to predict exploitability, and patches before attackers strike.</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section id="agents">
+    <div class="container">
+        <div class="section-header">
+            <h2>Meet the Agents</h2>
+            <p>Your AI security team, embedded in the operating system.</p>
+        </div>
+        <div class="agent-row">
+            <div class="agent-card">
+                <h4>Threat Hunter</h4>
+                <div class="name">Jitedasti</div>
+                <div class="desc">Reads logs 24/7. Detects brute force, web attacks, and file integrity violations. Uses LLM for deep analysis.</div>
+            </div>
+            <div class="agent-card">
+                <h4>Self-Healer</h4>
+                <div class="name">Galinja</div>
+                <div class="desc">Detects compromise, isolates the system, dumps forensics, restores from backup — all autonomously.</div>
+            </div>
+            <div class="agent-card">
+                <h4>Deception Engine</h4>
+                <div class="name">Oysgja</div>
+                <div class="desc">Deploys fake SSH, HTTP, and database services. Studies attacker behavior. Feeds intel to threat hunter.</div>
+            </div>
+            <div class="agent-card">
+                <h4>Predictive Oracle</h4>
+                <div class="name">Suyarma</div>
+                <div class="desc">Predicts which CVEs will be exploited. Cross-references CISA KEV. Pre-stages patches.</div>
+            </div>
+            <div class="agent-card">
+                <h4>Biometric Guardian</h4>
+                <div class="name">Papa</div>
+                <div class="desc">Learns your typing and work patterns. Blocks impersonators. Behavioral biometrics for your server.</div>
+            </div>
+            <div class="agent-card">
+                <h4>CEO Commander</h4>
+                <div class="name">Aadhipati</div>
+                <div class="desc">Voice-commandable in Nepali and English. Controls all agents. Creates new agents on demand. Your AI sovereign.</div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section id="security" style="background: #0f172a;">
+    <div class="container">
+        <div class="section-header">
+            <h2>Security That Thinks Ahead</h2>
+            <p>Post-quantum cryptography and AI-driven defense — not afterthoughts, but foundations.</p>
+        </div>
+        <table class="compare-table">
+            <thead>
+                <tr>
+                    <th>Security Feature</th>
+                    <th>KIRAT OS</th>
+                    <th>Ubuntu Server</th>
+                    <th>RHEL 9</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td>Post-Quantum TLS (Kyber)</td><td class="yes">✓ Default</td><td class="no">✗</td><td class="no">✗</td></tr>
+                <tr><td>Post-Quantum SSH</td><td class="yes">✓ Default</td><td class="no">✗</td><td class="no">✗</td></tr>
+                <tr><td>AI Threat Hunter</td><td class="yes">✓ Built-in</td><td class="no">✗</td><td class="no">✗</td></tr>
+                <tr><td>Self-Healing Agent</td><td class="yes">✓ Built-in</td><td class="no">✗</td><td class="no">✗</td></tr>
+                <tr><td>Honeypot Deception</td><td class="yes">✓ Built-in</td><td class="no">✗</td><td class="no">✗</td></tr>
+                <tr><td>Predictive Patching</td><td class="yes">✓ Built-in</td><td class="no">✗</td><td class="no">✗</td></tr>
+                <tr><td>LUKS2 Disk Encryption</td><td class="yes">✓ Argon2id</td><td class="partial">△ Optional</td><td class="partial">△ Optional</td></tr>
+                <tr><td>Kernel Module Signing</td><td class="yes">✓ Enforced</td><td class="partial">△ Optional</td><td class="partial">△ Optional</td></tr>
+                <tr><td>FIDO2 SSH Keys</td><td class="yes">✓ Ready</td><td class="partial">△ Manual</td><td class="partial">△ Manual</td></tr>
+                <tr><td>Commercial Support</td><td class="partial">△ Community</td><td class="yes">✓ Canonical</td><td class="yes">✓ Red Hat</td></tr>
+            </tbody>
+        </table>
+    </div>
+</section>
+
+<section>
+    <div class="container">
+        <div class="section-header">
+            <h2>Get Started in 5 Minutes</h2>
+            <p>Download the ISO, boot from USB, and deploy your first AI agent.</p>
+        </div>
+        <div class="code-block">
+<span class="comment"># 1. Download KIRAT OS ISO</span>
+<span class="cmd">wget</span> <span class="arg">https://github.com/kirat-os/releases/download/v2.0.0/kirat-os-2.0.0.iso</span>
+
+<span class="comment"># 2. Write to USB (Linux)</span>
+<span class="cmd">sudo dd if=</span><span class="arg">kirat-os-2.0.0.iso</span> <span class="cmd">of=</span><span class="arg">/dev/sdX</span> <span class="cmd">bs=4M status=progress</span>
+
+<span class="comment"># 3. Boot and install</span>
+<span class="comment"># Select "Install KIRAT OS" from GRUB menu</span>
+
+<span class="comment"># 4. After first boot, verify agents</span>
+<span class="cmd">sudo systemctl status</span> <span class="arg">jitedasti-ai galinja-ai oysgja-ai suyarma-ai papa-ai aadhipati-ai</span>
+        </div>
+        <div style="text-align: center; margin-top: 32px;">
+            <a href="https://github.com/kirat-os/kirat-os/releases" class="btn btn-primary">Download ISO</a>
+            <a href="https://docs.kirat-os.org/installation" class="btn btn-secondary">Full Installation Guide</a>
+        </div>
+    </div>
+</section>
+
+<section>
+    <div class="container">
+        <div class="cta-section">
+            <h2>Ready to Let Your Server Think?</h2>
+            <p>Join the community of AI infrastructure pioneers. Free, open source, and post-quantum secure.</p>
+            <div class="cta-group" style="justify-content: center;">
+                <a href="https://github.com/kirat-os" class="btn btn-primary">⭐ Star on GitHub</a>
+                <a href="https://discord.gg/kirat-os" class="btn btn-secondary">Join Discord</a>
+            </div>
+        </div>
+    </div>
+</section>
+
+<footer>
+    <div class="container">
+        <p>
+            <a href="https://github.com/kirat-os">GitHub</a>
+            <a href="https://docs.kirat-os.org">Documentation</a>
+            <a href="https://discord.gg/kirat-os">Discord</a>
+            <a href="https://twitter.com/kirat_os">X / Twitter</a>
+        </p>
+        <p style="margin-top: 16px;">© 2026 KIRAT OS Project. AGPLv3 Licensed. Built with ambition.</p>
+    </div>
+</footer>
+
+</body>
+</html>

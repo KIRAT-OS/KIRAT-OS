@@ -1,0 +1,52 @@
+[Unit]
+Description=KIRAT OS Quantum AI Ecosystem
+Documentation=https://docs.kirat-os.local/quantum-ai
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/kirat-os/quantum-ai
+Environment=PYTHONPATH=/opt/kirat-os/quantum-ai
+Environment=QUANTUM_LOG_LEVEL=info
+Environment=KIRAT_QUANTUM_MAX_QUBITS=16
+EnvironmentFile=-/etc/kirat-os/quantum-ai.env
+
+ExecStart=/opt/kirat-os/quantum-ai/venv/bin/python -m uvicorn ecosystem_api:app \
+    --host 127.0.0.1 \
+    --port 18082 \
+    --workers 2 \
+    --log-level info \
+    --access-log
+
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+MemoryMax=4G
+CPUQuota=300%
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/kirat-os/quantum-ai/data /opt/kirat-os/quantum-ai/logs /var/log/kirat-quantum-ai
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

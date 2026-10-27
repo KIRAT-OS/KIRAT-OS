@@ -7,10 +7,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
-      - run: pip install pytest httpx websockets psutil
-      # Syntax-check every Python source. The previous step used
-      # PowerShell (Get-ChildItem | ForEach-Object) which does not exist
-      # on the Ubuntu runner's bash — it failed with exit 127 on every
-      # push. python -m compileall is the portable equivalent.
+      - run: pip install pytest httpx websockets psutil fastapi slowapi jinja2 pynacl numpy scipy uvicorn redis
       - name: Syntax-check all Python sources
         run: python -m compileall -q .
+      - name: Check shell syntax
+        run: find . -name '*.sh' -type f -exec bash -n '{}' +
+      - name: Test Sentinel dashboard and installer
+        run: python -m pytest -q tests/test_sentinel_security.py tests/test_dashboard_security.py tests/test_install_native_security.py
+      - name: Test AI agents
+        run: python -m pytest -q ai-agents/tests/test_security_regressions.py
+      - name: Test RBAC backup and integration
+        run: python -m pytest -q tests/test_security_regressions.py
+      - name: Test Quantum simulator
+        run: python -m pytest -q quantum-ai/tests
+      - name: Test live ISO builder safety
+        run: bash tests/test_build_iso_regressions.sh
