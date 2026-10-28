@@ -7,7 +7,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
-      - run: pip install pytest httpx websockets psutil fastapi slowapi jinja2 pynacl numpy scipy uvicorn redis python-dotenv
+      - run: pip install pytest pynacl numpy scipy -r dashboard/requirements.txt
       - name: Syntax-check all Python sources
         run: python -m compileall -q .
       - name: Check shell syntax
